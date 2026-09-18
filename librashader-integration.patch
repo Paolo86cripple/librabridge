@@ -1,5 +1,5 @@
 diff --git a/Engine/gfx/ali3dogl.cpp b/Engine/gfx/ali3dogl.cpp
-index 1d4ee62..9e71cfe 100644
+index 1d4ee62..6590a71 100644
 --- a/Engine/gfx/ali3dogl.cpp
 +++ b/Engine/gfx/ali3dogl.cpp
 @@ -16,6 +16,7 @@
@@ -71,7 +71,7 @@ index 1d4ee62..9e71cfe 100644
 +    if (!preset_path || !*preset_path)
 +        return;
 +
-+    _librashader = std::make_unique<OGL::LibrashaderGL>();
++    _librashader.reset(new OGL::LibrashaderGL());
 +    if (!_librashader->Init(preset_path, SDL_GL_GetProcAddress))
 +    {
 +        Debug::Printf(kDbgMsg_Warn, "librashader: %s -- continuing without shaders",
