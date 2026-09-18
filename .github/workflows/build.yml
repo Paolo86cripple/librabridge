@@ -11,9 +11,6 @@ on:
         default: '3fc397205c6a188288a3c43a8ff44a342b7f6389'
 
 env:
-  # Pinned to the commit the patch in this repo was generated against.
-  # If you bump this, the "Apply librashader patch" step below is where
-  # it will tell you the patch needs a rebase.
   AGS_REF: ${{ github.event.inputs.ags_ref || '3fc397205c6a188288a3c43a8ff44a342b7f6389' }}
 
 jobs:
@@ -52,10 +49,7 @@ jobs:
         run: |
           cd librashader
           cargo build --release -p librashader-capi --no-default-features --features runtime-opengl
-          rustc --version
 
-      # Same package list AGS's own CI uses to build SDL2 (via CMake
-      # FetchContent) with full OpenGL/X11/Wayland support on Ubuntu.
       - name: Install SDL2 build dependencies
         run: |
           sudo apt-get update -y
@@ -64,6 +58,10 @@ jobs:
             libusb-1.0-0-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
             libxss-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
             libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev fcitx-libs-dev
+
+      - name: Install Qt6 for agssetup GUI
+        run: |
+          sudo apt-get install -y qt6-base-dev qt6-base-dev-tools
 
       - name: Cache CMake FetchContent dependencies
         uses: actions/cache@v4
@@ -77,12 +75,18 @@ jobs:
       - name: Build AGS engine (with the librashader patch applied)
         run: cmake --build ags/build --config Release --parallel 4
 
+      - name: Build agssetup GUI (C++/Qt6)  # <-- NUOVO STEP
+        run: |
+          cd librabridge
+          qmake6 agssetup.pro
+          make -j$(nproc)
+
       - name: Collect artifacts
         run: |
           mkdir -p dist
           find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} dist/ \;
           cp librashader/target/release/liblibrashader_capi.so dist/librashader.so
-          cp librabridge/agssetup.py dist/
+          cp librabridge/agssetup dist/agssetup  # <-- QUI: binario C++ invece di .py
           echo "Built from AGS ${AGS_REF}, librashader $(cd librashader && git rev-parse HEAD)" > dist/BUILD_INFO.txt
 
       - name: Upload build
