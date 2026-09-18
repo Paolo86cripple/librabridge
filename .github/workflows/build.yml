@@ -1,0 +1,93 @@
+name: Build AGS + librashader (Linux x86_64)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ags_ref:
+        description: 'adventuregamestudio/ags commit/branch to build against'
+        required: false
+        default: '3fc397205c6a188288a3c43a8ff44a342b7f6389'
+
+env:
+  # Pinned to the commit the patch in this repo was generated against.
+  # If you bump this, the "Apply librashader patch" step below is where
+  # it will tell you the patch needs a rebase.
+  AGS_REF: ${{ github.event.inputs.ags_ref || '3fc397205c6a188288a3c43a8ff44a342b7f6389' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout librabridge
+        uses: actions/checkout@v4
+        with:
+          path: librabridge
+
+      - name: Checkout AGS
+        uses: actions/checkout@v4
+        with:
+          repository: adventuregamestudio/ags
+          ref: ${{ env.AGS_REF }}
+          path: ags
+
+      - name: Apply librashader patch
+        run: |
+          cd ags
+          git apply --stat ../librabridge/librashader-integration.patch
+          git apply ../librabridge/librashader-integration.patch
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout librashader
+        uses: actions/checkout@v4
+        with:
+          repository: SnowflakePowered/librashader
+          path: librashader
+
+      - name: Build librashader.so (OpenGL runtime only)
+        run: |
+          cd librashader
+          cargo build --release -p librashader-capi --no-default-features --features runtime-opengl
+          rustc --version
+
+      # Same package list AGS's own CI uses to build SDL2 (via CMake
+      # FetchContent) with full OpenGL/X11/Wayland support on Ubuntu.
+      - name: Install SDL2 build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            gnome-desktop-testing libasound2-dev libpulse-dev libaudio-dev libjack-dev libsndio-dev \
+            libusb-1.0-0-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxss-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev fcitx-libs-dev
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: ags/build/_deps
+          key: fetchcontent-${{ runner.os }}-${{ env.AGS_REF }}-${{ hashFiles('ags/CMakeLists.txt', 'ags/CMake/Fetch*.cmake') }}
+
+      - name: Configure CMake
+        run: cmake -S ags -B ags/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build AGS engine (with the librashader patch applied)
+        run: cmake --build ags/build --config Release --parallel 4
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} dist/ \;
+          cp librashader/target/release/liblibrashader_capi.so dist/librashader.so
+          cp librabridge/agssetup.py dist/
+          echo "Built from AGS ${AGS_REF}, librashader $(cd librashader && git rev-parse HEAD)" > dist/BUILD_INFO.txt
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ags-librashader-linux-x86_64
+          path: dist/
+          if-no-files-found: error
