@@ -168,11 +168,32 @@ class AGSSetup(QWidget):
     def _save(self) -> bool:
         self._apply_to_cfg()
         try:
+            # Ensure directory exists
+            cfg_dir = os.path.dirname(self.cfg_path)
+            if cfg_dir and not os.path.exists(cfg_dir):
+                os.makedirs(cfg_dir, exist_ok=True)
+            
             with open(self.cfg_path, "w") as f:
                 self.cfg.write(f)
+            
             preset = self.shader_path.text().strip()
             sidecar = self._shader_sidecar_path()
             if preset:
+                # Validate preset path exists
+                if not os.path.isfile(preset):
+                    QMessageBox.warning(
+                        self, "Invalid preset path",
+                        f"Shader preset file does not exist: {preset}"
+                    )
+                    return False
+                # Store relative path if possible
+                if os.path.isabs(preset):
+                    try:
+                        rel_preset = os.path.relpath(preset, self.game_dir)
+                        preset = rel_preset
+                    except (ValueError, OSError):
+                        pass  # Keep absolute if relpath fails
+                
                 with open(sidecar, "w") as f:
                     f.write(preset)
             elif os.path.exists(sidecar):
@@ -189,11 +210,16 @@ class AGSSetup(QWidget):
         # dependencies and isn't a known non-game file.
         skip = {"agssetup.py", "winsetup.exe", "acwin.exe"}
         candidates = []
+        dir_name = os.path.basename(self.game_dir.rstrip('/\\'))
+        
         for name in sorted(os.listdir(self.game_dir)):
             full = os.path.join(self.game_dir, name)
             if name in skip or not os.path.isfile(full):
                 continue
             if os.access(full, os.X_OK) and not name.endswith((".cfg", ".ags", ".so", ".dll")):
+                # Prefer exact directory name match, then "ags"
+                if name == dir_name or name == "ags":
+                    return full
                 candidates.append(full)
         return candidates[0] if candidates else None
 

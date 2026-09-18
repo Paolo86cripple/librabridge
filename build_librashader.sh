@@ -11,6 +11,17 @@ set -euo pipefail
 
 ENGINE_DIR="${1:?Usage: build_librashader.sh /path/to/ags/engine/output/dir}"
 
+# Validate engine directory exists and is writable
+if [ ! -d "$ENGINE_DIR" ]; then
+  echo "Error: Engine directory does not exist: $ENGINE_DIR" >&2
+  exit 1
+fi
+
+if [ ! -w "$ENGINE_DIR" ]; then
+  echo "Error: Engine directory is not writable: $ENGINE_DIR" >&2
+  exit 1
+fi
+
 if ! command -v cargo >/dev/null; then
   echo "cargo not found. Install a Rust toolchain (rustup.rs) and re-run." >&2
   exit 1
@@ -19,11 +30,28 @@ fi
 RUST_VER="$(rustc --version | awk '{print $2}')"
 echo "Using rustc $RUST_VER"
 
+# Check Rust version (librashader requires >= 1.85)
+RUST_MAJOR=$(echo "$RUST_VER" | cut -d. -f1)
+RUST_MINOR=$(echo "$RUST_VER" | cut -d. -f2)
+RUST_VERSION_NUM=$((RUST_MAJOR * 100 + RUST_MINOR))
+
+if [ "$RUST_VERSION_NUM" -lt 185 ]; then
+  echo "Error: librashader requires Rust >= 1.85 (edition 2024), but found $RUST_VER" >&2
+  echo "Update Rust via rustup: https://rustup.rs" >&2
+  exit 1
+fi
+
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-git clone --depth 1 https://github.com/SnowflakePowered/librashader.git "$WORKDIR/librashader"
-cd "$WORKDIR/librashader"
+echo "Cloning librashader..."
+git clone --depth 1 --quiet https://github.com/SnowflakePowered/librashader.git "$WORKDIR/librashader" 2>&1 | grep -v "^hint:" || true
+if [ ! -d "$WORKDIR/librashader" ]; then
+  echo "Error: Failed to clone librashader repository" >&2
+  exit 1
+fi
+
+cd "$WORKDIR/librashader" || exit 1
 
 # Only the OpenGL runtime is built: no Vulkan/D3D/Metal deps, much faster,
 # and it's the only backend the AGS patch calls into.
