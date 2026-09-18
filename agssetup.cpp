@@ -189,8 +189,7 @@ private:
 
     bool save() {
         QSettings cfg(cfgPath, QSettings::IniFormat);
-        cfg.setIniCodec("UTF-8");
-        
+
         // Graphics
         cfg.setValue("graphics/driver", driver->currentText());
         cfg.setValue("graphics/windowed", windowed->isChecked() ? "1" : "0");

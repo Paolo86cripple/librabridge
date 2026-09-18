@@ -65,6 +65,10 @@ jobs:
             libxss-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
             libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev fcitx-libs-dev
 
+      - name: Install Qt6 for agssetup GUI
+        run: |
+          sudo apt-get install -y qt6-base-dev qt6-base-dev-tools
+
       - name: Cache CMake FetchContent dependencies
         uses: actions/cache@v4
         with:
@@ -77,12 +81,18 @@ jobs:
       - name: Build AGS engine (with the librashader patch applied)
         run: cmake --build ags/build --config Release --parallel 4
 
+      - name: Build agssetup GUI (C++/Qt6)
+        run: |
+          cd librabridge
+          qmake6 agssetup.pro
+          make -j$(nproc)
+
       - name: Collect artifacts
         run: |
           mkdir -p dist
           find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} dist/ \;
           cp librashader/target/release/liblibrashader_capi.so dist/librashader.so
-          cp librabridge/agssetup.py dist/
+          cp librabridge/agssetup dist/agssetup
           echo "Built from AGS ${AGS_REF}, librashader $(cd librashader && git rev-parse HEAD)" > dist/BUILD_INFO.txt
 
       - name: Upload build
