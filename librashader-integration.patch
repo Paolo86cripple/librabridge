@@ -1,3 +1,16 @@
+diff --git a/Engine/CMakeLists.txt b/Engine/CMakeLists.txt
+index 7faa4a2..62c22c3 100644
+--- a/Engine/CMakeLists.txt
++++ b/Engine/CMakeLists.txt
+@@ -310,6 +310,8 @@ target_sources(engine
+     gfx/ali3dsw.h
+     gfx/blender.cpp
+     gfx/blender.h
++    gfx/librashader_gl.cpp
++    gfx/librashader_gl.h
+     gfx/ddb.h
+     gfx/gfx_util.cpp
+     gfx/gfx_util.h
 diff --git a/Engine/gfx/ali3dogl.cpp b/Engine/gfx/ali3dogl.cpp
 index 1d4ee62..6590a71 100644
 --- a/Engine/gfx/ali3dogl.cpp
