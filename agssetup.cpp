@@ -147,7 +147,6 @@ private:
 
     void loadFromConfig() {
         QSettings cfg(cfgPath, QSettings::IniFormat);
-        cfg.setIniCodec("UTF-8");
         
         // Graphics
         setComboIndex(driver, cfg.value("graphics/driver", "OGL").toString());
