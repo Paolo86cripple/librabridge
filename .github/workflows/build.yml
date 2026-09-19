@@ -6,15 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       ags_ref:
-        description: 'adventuregamestudio/ags commit/branch to build against'
+        description: 'adventuregamestudio/ags commit/branch to build against (default: main)'
         required: false
-        default: '3fc397205c6a188288a3c43a8ff44a342b7f6389'
+        default: 'main'
+  schedule:
+    # Build every day at 2 AM UTC to keep up with AGS main
+    - cron: '0 2 * * *'
 
 env:
-  # Pinned to the commit the patch in this repo was generated against.
-  # If you bump this, the "Apply librashader patch" step below is where
-  # it will tell you the patch needs a rebase.
-  AGS_REF: ${{ github.event.inputs.ags_ref || '3fc397205c6a188288a3c43a8ff44a342b7f6389' }}
+  # Uses main branch of AGS by default, can be overridden via workflow_dispatch
+  # Note: If you change this, ensure the librashader-integration.patch is compatible
+  AGS_REF: ${{ github.event.inputs.ags_ref || 'main' }}
 
 jobs:
   build:
@@ -36,7 +38,11 @@ jobs:
       - name: Apply librashader patch
         run: |
           cd ags
-          git apply --stat ../librabridge/librashader-integration.patch
+          git apply --stat ../librabridge/librashader-integration.patch || {
+            echo "::error::Patch failed! The librashader-integration.patch needs to be rebased for AGS ${AGS_REF}"
+            echo "Please update the patch file and push to librabridge repository"
+            exit 1
+          }
           git apply ../librabridge/librashader-integration.patch
 
       - name: Install Rust
@@ -95,7 +101,9 @@ jobs:
           cp librabridge/agssetup dist/agssetup
           # Remove legacy Python script if it exists
           rm -f dist/agssetup.py
-          echo "Built from AGS ${AGS_REF}, librashader $(cd librashader && git rev-parse HEAD)" > dist/BUILD_INFO.txt
+          # Include AGS commit info in build
+          echo "Built from AGS ${AGS_REF} ($(cd ags && git rev-parse --short HEAD)), librashader $(cd librashader && git rev-parse --short HEAD)" > dist/BUILD_INFO.txt
+          echo "Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> dist/BUILD_INFO.txt
 
       - name: Upload build
         uses: actions/upload-artifact@v4
