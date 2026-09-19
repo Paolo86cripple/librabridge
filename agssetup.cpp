@@ -104,16 +104,16 @@ private:
     QByteArray windowGeometry;
     
     // UI Elements
-    QComboBox *driver;
-    QCheckBox *windowed;
-    QComboBox *fullscreenMode;
-    QComboBox *scaleFs;
-    QCheckBox *vsync;
-    QCheckBox *antialias;
-    QCheckBox *soundEnabled;
-    QCheckBox *speechEnabled;
-    QLineEdit *shaderPath;
-    QLineEdit *gamePath;
+    QComboBox *driver = nullptr;
+    QCheckBox *windowed = nullptr;
+    QComboBox *fullscreenMode = nullptr;
+    QComboBox *scaleFs = nullptr;
+    QCheckBox *vsync = nullptr;
+    QCheckBox *antialias = nullptr;
+    QCheckBox *soundEnabled = nullptr;
+    QCheckBox *speechEnabled = nullptr;
+    QLineEdit *shaderPath = nullptr;
+    QLineEdit *gamePath = nullptr;
 
     void loadPreferences() {
         QSettings prefs(QSettings::IniFormat, QSettings::UserScope, "AGSSetup", "agssetup");
@@ -366,13 +366,15 @@ private:
         // Save preferences before closing
         savePreferences();
         
-        // Close current window and open setup for selected game
-        this->close();
-        
-        // Create new setup window for the selected game
+        // Create and show the setup window for the selected game FIRST,
+        // then close the launcher: closing the last visible window before
+        // the new one is shown could make the application quit.
         AGSSetup *setup = new AGSSetup(selectedDir, false);
+        setup->setAttribute(Qt::WA_DeleteOnClose);
         setup->resize(420, 420);
         setup->show();
+
+        this->close();
     }
 
     bool save() {
@@ -558,16 +560,14 @@ int main(int argc, char *argv[]) {
         initialDir = QDir::current().absolutePath();
     }
     
-    if (launcherMode) {
-        AGSSetup win(initialDir, true);
-        win.resize(500, 200);
-        win.show();
-    } else {
-        AGSSetup win(initialDir);
-        win.resize(420, 420);
-        win.show();
-    }
-    
+    // The window must outlive this block: it has to still exist when
+    // app.exec() runs. (Previously it was declared inside the if/else
+    // and destroyed before the event loop started, so no window ever appeared.)
+    AGSSetup *win = new AGSSetup(initialDir, launcherMode);
+    win->setAttribute(Qt::WA_DeleteOnClose);
+    win->resize(launcherMode ? QSize(500, 200) : QSize(420, 420));
+    win->show();
+
     return app.exec();
 }
 
