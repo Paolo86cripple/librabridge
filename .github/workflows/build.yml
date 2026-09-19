@@ -6,17 +6,18 @@ on:
   workflow_dispatch:
     inputs:
       ags_ref:
-        description: 'adventuregamestudio/ags commit/branch to build against (default: main)'
+        description: 'adventuregamestudio/ags commit/branch to build against (default: master)'
         required: false
-        default: 'main'
+        default: 'master'
   schedule:
-    # Build every day at 2 AM UTC to keep up with AGS main
+    # Build every day at 2 AM UTC to keep up with AGS master
     - cron: '0 2 * * *'
 
 env:
-  # Uses main branch of AGS by default, can be overridden via workflow_dispatch
-  # Note: If you change this, ensure the librashader-integration.patch is compatible
-  AGS_REF: ${{ github.event.inputs.ags_ref || 'main' }}
+  # NB: il branch di default di adventuregamestudio/ags e' "master", non "main".
+  # Puo' essere sovrascritto via workflow_dispatch (branch, tag o commit SHA).
+  # Se cambi questo valore, assicurati che librashader-integration.patch sia compatibile.
+  AGS_REF: ${{ github.event.inputs.ags_ref || 'master' }}
 
 jobs:
   build:
@@ -38,7 +39,7 @@ jobs:
       - name: Apply librashader patch
         run: |
           cd ags
-          git apply --stat ../librabridge/librashader-integration.patch || {
+          git apply --check ../librabridge/librashader-integration.patch || {
             echo "::error::Patch failed! The librashader-integration.patch needs to be rebased for AGS ${AGS_REF}"
             echo "Please update the patch file and push to librabridge repository"
             exit 1
