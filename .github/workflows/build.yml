@@ -93,6 +93,8 @@ jobs:
           find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} dist/ \;
           cp librashader/target/release/liblibrashader_capi.so dist/librashader.so
           cp librabridge/agssetup dist/agssetup
+          # Remove legacy Python script if it exists
+          rm -f dist/agssetup.py
           echo "Built from AGS ${AGS_REF}, librashader $(cd librashader && git rev-parse HEAD)" > dist/BUILD_INFO.txt
 
       - name: Upload build

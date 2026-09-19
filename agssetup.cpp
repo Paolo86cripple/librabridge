@@ -8,6 +8,7 @@
 // - Allows selecting a librashader preset
 // - Can launch games from any directory (launcher mode)
 // - Shader directory browser with preset selection
+// - Saves preferences (last game dir, last shader dir, window size/pos)
 //
 // The preset path is stored in a sidecar file (.agssetup_shader_preset)
 // and passed to the engine via AGS_LIBRASHADER_PRESET environment variable.
@@ -32,9 +33,6 @@
 #include <QFile>
 #include <QStandardPaths>
 #include <QCoreApplication>
-#include <QTreeView>
-#include <QFileSystemModel>
-#include <QSplitter>
 
 // Keys from Engine/main/config.cpp - preserve exact spelling
 const QStringList GRAPHICS_DRIVERS = {"OGL", "Software"};
@@ -46,12 +44,21 @@ const QStringList SCALE_MODES = {
     "max_round", "stretch", "proportional", "round"
 };
 
+// Preferences keys
+const char *PREFS_GROUP = "Preferences";
+const char *PREFS_LAST_GAME_DIR = "LastGameDirectory";
+const char *PREFS_LAST_SHADER_DIR = "LastShaderDirectory";
+const char *PREFS_WINDOW_GEOMETRY = "WindowGeometry";
+
 
 class AGSSetup : public QWidget {
     Q_OBJECT
 public:
     AGSSetup(const QString &initialDir, bool launcherMode = false, QWidget *parent = nullptr)
         : QWidget(parent), initialDir(initialDir), launcherMode(launcherMode) {
+        
+        // Load preferences
+        loadPreferences();
         
         // In launcher mode, start with file browser; otherwise load game dir
         if (launcherMode) {
@@ -69,7 +76,19 @@ public:
         buildUI();
         if (!launcherMode) {
             loadFromConfig();
+        } else if (!lastGameDir.isEmpty()) {
+            gamePath->setText(lastGameDir);
         }
+        
+        // Restore window geometry
+        if (!windowGeometry.isNull()) {
+            this->restoreGeometry(windowGeometry);
+        }
+    }
+
+    ~AGSSetup() {
+        // Preferences are saved in closeEvent, not here
+        // (to avoid double-save and potential race conditions)
     }
 
 private:
@@ -78,6 +97,11 @@ private:
     QString cfgPath;
     QString sidecarPath;
     bool launcherMode;
+    
+    // Preferences
+    QString lastGameDir = "";
+    QString lastShaderDir = "";
+    QByteArray windowGeometry;
     
     // UI Elements
     QComboBox *driver;
@@ -90,8 +114,32 @@ private:
     QCheckBox *speechEnabled;
     QLineEdit *shaderPath;
     QLineEdit *gamePath;
-    QTreeView *shaderTree;
-    QFileSystemModel *shaderModel;
+
+    void loadPreferences() {
+        QSettings prefs(QSettings::IniFormat, QSettings::UserScope, "AGSSetup", "agssetup");
+        lastGameDir = prefs.value(QString(PREFS_GROUP) + "/" + PREFS_LAST_GAME_DIR, "").toString();
+        lastShaderDir = prefs.value(QString(PREFS_GROUP) + "/" + PREFS_LAST_SHADER_DIR, "").toString();
+        windowGeometry = prefs.value(QString(PREFS_GROUP) + "/" + PREFS_WINDOW_GEOMETRY).toByteArray();
+    }
+
+    void savePreferences() {
+        QSettings prefs(QSettings::IniFormat, QSettings::UserScope, "AGSSetup", "agssetup");
+        
+        if (launcherMode && gamePath) {
+            prefs.setValue(QString(PREFS_GROUP) + "/" + PREFS_LAST_GAME_DIR, gamePath->text());
+        } else {
+            prefs.setValue(QString(PREFS_GROUP) + "/" + PREFS_LAST_GAME_DIR, gameDir);
+        }
+        
+        if (shaderPath) {
+            QFileInfo shaderInfo(shaderPath->text());
+            if (shaderInfo.exists()) {
+                prefs.setValue(QString(PREFS_GROUP) + "/" + PREFS_LAST_SHADER_DIR, shaderInfo.path());
+            }
+        }
+        
+        prefs.setValue(QString(PREFS_GROUP) + "/" + PREFS_WINDOW_GEOMETRY, this->saveGeometry());
+    }
 
     void buildUI() {
         QVBoxLayout *root = new QVBoxLayout(this);
@@ -141,7 +189,7 @@ private:
         gfxForm->addRow(antialias);
         root->addWidget(gfxBox);
 
-        // Shader Group with Tree View
+        // Shader Group with Directory Browser
         QGroupBox *shaderBox = new QGroupBox("Shader (librashader - OGL renderer only)", this);
         QVBoxLayout *shaderLayout = new QVBoxLayout(shaderBox);
         
@@ -203,7 +251,28 @@ private:
     void loadFromConfig() {
         if (launcherMode) return;
         
+        // Check if config file exists
+        QFile cfgFile(cfgPath);
+        if (!cfgFile.exists()) {
+            // File doesn't exist - use defaults
+            return;
+        }
+        
+        // Check if file is readable
+        if (!cfgFile.permissions().testFlag(QFile::ReadUser)) {
+            QMessageBox::warning(this, "Permission denied", 
+                "Cannot read acsetup.cfg: permission denied");
+            return;
+        }
+        
         QSettings cfg(cfgPath, QSettings::IniFormat);
+        
+        // Check if config was parsed correctly
+        if (cfg.status() != QSettings::NoError) {
+            QMessageBox::warning(this, "Config error", 
+                "Failed to parse acsetup.cfg");
+            return;
+        }
         
         // Graphics
         setComboIndex(driver, cfg.value("graphics/driver", "OGL").toString());
@@ -234,19 +303,23 @@ private:
     }
 
     void browseShader() {
+        QString startDir = lastShaderDir.isEmpty() ? gameDir : lastShaderDir;
         QString path = QFileDialog::getOpenFileName(
             this, "Choose a RetroArch shader preset",
-            gameDir, "Shader presets (*.slangp *.glslp);;All files (*)"
+            startDir, "Shader presets (*.slangp *.glslp);;All files (*)"
         );
         if (!path.isEmpty()) {
             shaderPath->setText(path);
+            // Update last shader dir
+            lastShaderDir = QFileInfo(path).path();
         }
     }
 
     void showShaderBrowser() {
+        QString startDir = lastShaderDir.isEmpty() ? gameDir : lastShaderDir;
         QString dir = QFileDialog::getExistingDirectory(
             this, "Select Shader Directory",
-            gameDir, QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
+            startDir, QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
         );
         if (!dir.isEmpty()) {
             // Show file dialog to select a preset from the directory
@@ -256,17 +329,22 @@ private:
             );
             if (!path.isEmpty()) {
                 shaderPath->setText(path);
+                // Update last shader dir only on successful selection
+                lastShaderDir = QFileInfo(path).path();
             }
         }
     }
 
     void browseGameDir() {
+        QString startDir = lastGameDir.isEmpty() ? initialDir : lastGameDir;
         QString dir = QFileDialog::getExistingDirectory(
             this, "Select Game Directory",
-            gamePath->text().isEmpty() ? initialDir : gamePath->text()
+            startDir, QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
         );
         if (!dir.isEmpty()) {
             gamePath->setText(dir);
+            // Update last game dir
+            lastGameDir = dir;
         }
     }
 
@@ -277,12 +355,16 @@ private:
             return;
         }
         
+        // Validate BEFORE closing the window
         if (!QFile::exists(QDir(selectedDir).filePath("acsetup.cfg"))) {
             QMessageBox::warning(this, "Invalid directory", 
                 "The selected directory does not contain an acsetup.cfg file.\n"
                 "Please select a valid AGS game directory.");
             return;
         }
+        
+        // Save preferences before closing
+        savePreferences();
         
         // Close current window and open setup for selected game
         this->close();
@@ -361,13 +443,15 @@ private:
 
     QString findEngineBinary() {
         // Look for engine binary in common locations
-        QStringList paths = {
-            QCoreApplication::applicationDirPath(),
-            QDir::homePath() + "/.local/share/ags",
-            QDir::homePath() + "/ags",
-            "/usr/local/bin",
-            "/usr/bin"
-        };
+        QStringList paths;
+        QString appDir = QCoreApplication::applicationDirPath();
+        if (!appDir.isEmpty()) {
+            paths.append(appDir);
+        }
+        paths.append(QDir::homePath() + "/.local/share/ags");
+        paths.append(QDir::homePath() + "/ags");
+        paths.append("/usr/local/bin");
+        paths.append("/usr/bin");
         
         for (const QString &path : paths) {
             QDir dir(path);
@@ -381,6 +465,24 @@ private:
             }
         }
         return QString();
+    }
+
+    void launchGameInternal(const QString &binaryPath) {
+        QProcess *proc = new QProcess(this);
+        proc->setProgram(binaryPath);
+        proc->setWorkingDirectory(gameDir);
+        
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        QString preset = shaderPath->text().trimmed();
+        
+        if (!preset.isEmpty() && driver->currentText() == "OGL") {
+            env.insert("AGS_LIBRASHADER_PRESET", preset);
+        } else {
+            env.remove("AGS_LIBRASHADER_PRESET");
+        }
+        
+        proc->setProcessEnvironment(env);
+        proc->startDetached();
     }
 
     void saveAndPlay() {
@@ -402,21 +504,10 @@ private:
             }
         }
         
-        QProcess *proc = new QProcess(this);
-        proc->setProgram(binary);
-        proc->setWorkingDirectory(gameDir);
+        // Save preferences before launching
+        savePreferences();
         
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        QString preset = shaderPath->text().trimmed();
-        
-        if (!preset.isEmpty() && driver->currentText() == "OGL") {
-            env.insert("AGS_LIBRASHADER_PRESET", preset);
-        } else {
-            env.remove("AGS_LIBRASHADER_PRESET");
-        }
-        
-        proc->setProcessEnvironment(env);
-        proc->startDetached();
+        launchGameInternal(binary);
         QApplication::quit();
     }
 
@@ -434,21 +525,16 @@ private:
             }
         }
         
-        QProcess *proc = new QProcess(this);
-        proc->setProgram(binary);
-        proc->setWorkingDirectory(gameDir);
+        // Save preferences before launching
+        savePreferences();
         
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        QString preset = shaderPath->text().trimmed();
-        
-        if (!preset.isEmpty() && driver->currentText() == "OGL") {
-            env.insert("AGS_LIBRASHADER_PRESET", preset);
-        } else {
-            env.remove("AGS_LIBRASHADER_PRESET");
-        }
-        
-        proc->setProcessEnvironment(env);
-        proc->startDetached();
+        launchGameInternal(binary);
+    }
+
+    // Override closeEvent to save preferences
+    void closeEvent(QCloseEvent *event) override {
+        savePreferences();
+        QWidget::closeEvent(event);
     }
 };
 
