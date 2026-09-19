@@ -1,9 +1,14 @@
-// agssetup.cpp - Native Linux replacement for AGS's winsetup.exe
+// agssetup.cpp - Native Linux replacement for AGS's winsetup.exe and launcher
 // Uses Qt6 (no Python required). Compile with:
 //   qmake6 -project && qmake6 && make
 // or with CMake (see CMakeLists.txt)
 //
-// Reads/writes acsetup.cfg and allows selecting a librashader preset.
+// Features:
+// - Reads/writes acsetup.cfg
+// - Allows selecting a librashader preset
+// - Can launch games from any directory (launcher mode)
+// - Shader directory browser with preset selection
+//
 // The preset path is stored in a sidecar file (.agssetup_shader_preset)
 // and passed to the engine via AGS_LIBRASHADER_PRESET environment variable.
 
@@ -27,6 +32,9 @@
 #include <QFile>
 #include <QStandardPaths>
 #include <QCoreApplication>
+#include <QTreeView>
+#include <QFileSystemModel>
+#include <QSplitter>
 
 // Keys from Engine/main/config.cpp - preserve exact spelling
 const QStringList GRAPHICS_DRIVERS = {"OGL", "Software"};
@@ -42,20 +50,34 @@ const QStringList SCALE_MODES = {
 class AGSSetup : public QWidget {
     Q_OBJECT
 public:
-    AGSSetup(const QString &gameDir, QWidget *parent = nullptr)
-        : QWidget(parent), gameDir(gameDir) {
-        cfgPath = QDir(gameDir).filePath("acsetup.cfg");
-        sidecarPath = QDir(gameDir).filePath(".agssetup_shader_preset");
+    AGSSetup(const QString &initialDir, bool launcherMode = false, QWidget *parent = nullptr)
+        : QWidget(parent), initialDir(initialDir), launcherMode(launcherMode) {
         
-        setWindowTitle("AGS Setup - " + QDir(gameDir).dirName());
+        // In launcher mode, start with file browser; otherwise load game dir
+        if (launcherMode) {
+            gameDir = initialDir;
+            cfgPath = "";
+            sidecarPath = "";
+            setWindowTitle("AGS Launcher - Select Game");
+        } else {
+            gameDir = initialDir;
+            cfgPath = QDir(gameDir).filePath("acsetup.cfg");
+            sidecarPath = QDir(gameDir).filePath(".agssetup_shader_preset");
+            setWindowTitle("AGS Setup - " + QDir(gameDir).dirName());
+        }
+        
         buildUI();
-        loadFromConfig();
+        if (!launcherMode) {
+            loadFromConfig();
+        }
     }
 
 private:
+    QString initialDir;
     QString gameDir;
     QString cfgPath;
     QString sidecarPath;
+    bool launcherMode;
     
     // UI Elements
     QComboBox *driver;
@@ -67,9 +89,35 @@ private:
     QCheckBox *soundEnabled;
     QCheckBox *speechEnabled;
     QLineEdit *shaderPath;
+    QLineEdit *gamePath;
+    QTreeView *shaderTree;
+    QFileSystemModel *shaderModel;
 
     void buildUI() {
         QVBoxLayout *root = new QVBoxLayout(this);
+
+        // Game Selection (for launcher mode)
+        if (launcherMode) {
+            QGroupBox *gameBox = new QGroupBox("Select Game Directory", this);
+            QVBoxLayout *gameLayout = new QVBoxLayout(gameBox);
+            
+            QHBoxLayout *gamePathRow = new QHBoxLayout();
+            gamePath = new QLineEdit(this);
+            gamePath->setPlaceholderText("Select the game directory containing acsetup.cfg");
+            QPushButton *browseGameBtn = new QPushButton("Browse...", this);
+            connect(browseGameBtn, &QPushButton::clicked, this, &AGSSetup::browseGameDir);
+            gamePathRow->addWidget(gamePath);
+            gamePathRow->addWidget(browseGameBtn);
+            gameLayout->addLayout(gamePathRow);
+            
+            QPushButton *openBtn = new QPushButton("Open Setup for Selected Game", this);
+            connect(openBtn, &QPushButton::clicked, this, &AGSSetup::openGameSetup);
+            gameLayout->addWidget(openBtn);
+            
+            root->addWidget(gameBox);
+            root->addStretch();
+            return; // Skip the rest for launcher mode
+        }
 
         // Graphics Group
         QGroupBox *gfxBox = new QGroupBox("Graphics", this);
@@ -93,23 +141,27 @@ private:
         gfxForm->addRow(antialias);
         root->addWidget(gfxBox);
 
-        // Shader Group
+        // Shader Group with Tree View
         QGroupBox *shaderBox = new QGroupBox("Shader (librashader - OGL renderer only)", this);
-        QFormLayout *shaderForm = new QFormLayout(shaderBox);
+        QVBoxLayout *shaderLayout = new QVBoxLayout(shaderBox);
         
-        QHBoxLayout *shaderRow = new QHBoxLayout();
+        // Shader path input
+        QHBoxLayout *shaderPathRow = new QHBoxLayout();
         shaderPath = new QLineEdit(this);
         shaderPath->setPlaceholderText("None - plain output");
         QPushButton *browseBtn = new QPushButton("Browse...", this);
         QPushButton *clearBtn = new QPushButton("Clear", this);
+        QPushButton *shaderBrowserBtn = new QPushButton("Browse Shader Directory...", this);
         
         connect(browseBtn, &QPushButton::clicked, this, &AGSSetup::browseShader);
         connect(clearBtn, &QPushButton::clicked, shaderPath, &QLineEdit::clear);
+        connect(shaderBrowserBtn, &QPushButton::clicked, this, &AGSSetup::showShaderBrowser);
         
-        shaderRow->addWidget(shaderPath);
-        shaderRow->addWidget(browseBtn);
-        shaderRow->addWidget(clearBtn);
-        shaderForm->addRow("Preset (.slangp/.glslp):", shaderRow);
+        shaderPathRow->addWidget(shaderPath);
+        shaderPathRow->addWidget(browseBtn);
+        shaderPathRow->addWidget(clearBtn);
+        shaderLayout->addLayout(shaderPathRow);
+        shaderLayout->addWidget(shaderBrowserBtn);
         
         QLabel *note = new QLabel(
             "Requires an engine build with the librashader patch. "
@@ -117,7 +169,7 @@ private:
             this
         );
         note->setWordWrap(true);
-        shaderForm->addRow(note);
+        shaderLayout->addWidget(note);
         root->addWidget(shaderBox);
 
         // Sound Group
@@ -135,17 +187,22 @@ private:
         QHBoxLayout *btnRow = new QHBoxLayout();
         QPushButton *saveBtn = new QPushButton("Save", this);
         QPushButton *playBtn = new QPushButton("Save && Play", this);
+        QPushButton *launchBtn = new QPushButton("Launch Game", this);
         
         connect(saveBtn, &QPushButton::clicked, this, &AGSSetup::save);
         connect(playBtn, &QPushButton::clicked, this, &AGSSetup::saveAndPlay);
+        connect(launchBtn, &QPushButton::clicked, this, &AGSSetup::launchGame);
         
         btnRow->addStretch(1);
         btnRow->addWidget(saveBtn);
         btnRow->addWidget(playBtn);
+        btnRow->addWidget(launchBtn);
         root->addLayout(btnRow);
     }
 
     void loadFromConfig() {
+        if (launcherMode) return;
+        
         QSettings cfg(cfgPath, QSettings::IniFormat);
         
         // Graphics
@@ -186,9 +243,61 @@ private:
         }
     }
 
-    bool save() {
-        QSettings cfg(cfgPath, QSettings::IniFormat);
+    void showShaderBrowser() {
+        QString dir = QFileDialog::getExistingDirectory(
+            this, "Select Shader Directory",
+            gameDir, QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
+        );
+        if (!dir.isEmpty()) {
+            // Show file dialog to select a preset from the directory
+            QString path = QFileDialog::getOpenFileName(
+                this, "Choose a shader preset",
+                dir, "Shader presets (*.slangp *.glslp);;All files (*)"
+            );
+            if (!path.isEmpty()) {
+                shaderPath->setText(path);
+            }
+        }
+    }
 
+    void browseGameDir() {
+        QString dir = QFileDialog::getExistingDirectory(
+            this, "Select Game Directory",
+            gamePath->text().isEmpty() ? initialDir : gamePath->text()
+        );
+        if (!dir.isEmpty()) {
+            gamePath->setText(dir);
+        }
+    }
+
+    void openGameSetup() {
+        QString selectedDir = gamePath->text().trimmed();
+        if (selectedDir.isEmpty()) {
+            QMessageBox::warning(this, "No directory selected", "Please select a game directory first.");
+            return;
+        }
+        
+        if (!QFile::exists(QDir(selectedDir).filePath("acsetup.cfg"))) {
+            QMessageBox::warning(this, "Invalid directory", 
+                "The selected directory does not contain an acsetup.cfg file.\n"
+                "Please select a valid AGS game directory.");
+            return;
+        }
+        
+        // Close current window and open setup for selected game
+        this->close();
+        
+        // Create new setup window for the selected game
+        AGSSetup *setup = new AGSSetup(selectedDir, false);
+        setup->resize(420, 420);
+        setup->show();
+    }
+
+    bool save() {
+        if (launcherMode) return false;
+        
+        QSettings cfg(cfgPath, QSettings::IniFormat);
+        
         // Graphics
         cfg.setValue("graphics/driver", driver->currentText());
         cfg.setValue("graphics/windowed", windowed->isChecked() ? "1" : "0");
@@ -250,6 +359,30 @@ private:
         return candidates.isEmpty() ? QString() : candidates.first();
     }
 
+    QString findEngineBinary() {
+        // Look for engine binary in common locations
+        QStringList paths = {
+            QCoreApplication::applicationDirPath(),
+            QDir::homePath() + "/.local/share/ags",
+            QDir::homePath() + "/ags",
+            "/usr/local/bin",
+            "/usr/bin"
+        };
+        
+        for (const QString &path : paths) {
+            QDir dir(path);
+            if (dir.exists("ags") || dir.exists("ags3") || dir.exists("ags-engine")) {
+                for (const QString &name : {"ags", "ags3", "ags-engine"}) {
+                    QString fullPath = dir.filePath(name);
+                    if (QFile::exists(fullPath) && QFileInfo(fullPath).isExecutable()) {
+                        return fullPath;
+                    }
+                }
+            }
+        }
+        return QString();
+    }
+
     void saveAndPlay() {
         if (!save()) {
             return;
@@ -257,12 +390,16 @@ private:
         
         QString binary = findGameBinary();
         if (binary.isEmpty()) {
-            QMessageBox::warning(
-                this, "Can't find game binary",
-                "No executable found next to acsetup.cfg. "
-                "Launch the game manually - your settings are saved."
-            );
-            return;
+            // Try to find engine binary
+            binary = findEngineBinary();
+            if (binary.isEmpty()) {
+                QMessageBox::warning(
+                    this, "Can't find game binary",
+                    "No executable found next to acsetup.cfg or in standard locations. "
+                    "Launch the game manually - your settings are saved."
+                );
+                return;
+            }
         }
         
         QProcess *proc = new QProcess(this);
@@ -282,22 +419,68 @@ private:
         proc->startDetached();
         QApplication::quit();
     }
+
+    void launchGame() {
+        QString binary = findGameBinary();
+        if (binary.isEmpty()) {
+            // Try to find engine binary
+            binary = findEngineBinary();
+            if (binary.isEmpty()) {
+                QMessageBox::warning(
+                    this, "Can't find game binary",
+                    "No executable found next to acsetup.cfg or in standard locations."
+                );
+                return;
+            }
+        }
+        
+        QProcess *proc = new QProcess(this);
+        proc->setProgram(binary);
+        proc->setWorkingDirectory(gameDir);
+        
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        QString preset = shaderPath->text().trimmed();
+        
+        if (!preset.isEmpty() && driver->currentText() == "OGL") {
+            env.insert("AGS_LIBRASHADER_PRESET", preset);
+        } else {
+            env.remove("AGS_LIBRASHADER_PRESET");
+        }
+        
+        proc->setProcessEnvironment(env);
+        proc->startDetached();
+    }
 };
 
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     
-    QString gameDir;
-    if (argc > 1) {
-        gameDir = QDir(argv[1]).absolutePath();
-    } else {
-        gameDir = QDir::current().absolutePath();
+    QString initialDir;
+    bool launcherMode = false;
+    
+    // Check if launched with --launcher flag
+    for (int i = 1; i < argc; i++) {
+        if (QString(argv[i]) == "--launcher" || QString(argv[i]) == "-l") {
+            launcherMode = true;
+        }
     }
     
-    AGSSetup win(gameDir);
-    win.resize(420, 420);
-    win.show();
+    if (argc > 1 && !launcherMode) {
+        initialDir = QDir(argv[1]).absolutePath();
+    } else {
+        initialDir = QDir::current().absolutePath();
+    }
+    
+    if (launcherMode) {
+        AGSSetup win(initialDir, true);
+        win.resize(500, 200);
+        win.show();
+    } else {
+        AGSSetup win(initialDir);
+        win.resize(420, 420);
+        win.show();
+    }
     
     return app.exec();
 }
