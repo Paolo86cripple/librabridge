@@ -46,6 +46,36 @@ struct GLLoaderThunk
 };
 GLProcLoader GLLoaderThunk::s_loader = nullptr;
 
+// AGS's GL loader targets an older GL and does not define these (GL 3.0 tokens).
+#ifndef GL_MAJOR_VERSION
+#define GL_MAJOR_VERSION 0x821B
+#endif
+#ifndef GL_MINOR_VERSION
+#define GL_MINOR_VERSION 0x821C
+#endif
+
+// Highest GLSL version the current GL context supports (GL 3.3 -> 330,
+// GL 4.x -> 4x0). librashader compiles every shader for this version, and
+// some presets need more than 330 (e.g. packUnorm4x8() is GLSL 4.00+).
+// Queried through the loader because this runs right after context creation,
+// possibly before the engine has loaded its own GL function pointers.
+static uint16_t DetectGlslVersion(GLProcLoader loader)
+{
+    typedef void (*GetIntegervFn)(unsigned int, int *);
+    GetIntegervFn get_integerv =
+        loader ? reinterpret_cast<GetIntegervFn>(loader("glGetIntegerv")) : nullptr;
+    if (!get_integerv)
+        return 330;
+    int major = 0, minor = 0;
+    get_integerv(GL_MAJOR_VERSION, &major);
+    get_integerv(GL_MINOR_VERSION, &minor);
+    if (major < 3 || (major == 3 && minor < 3))
+        return 330; // librashader's minimum
+    if (major > 4 || (major == 4 && minor > 6))
+        return 460;
+    return static_cast<uint16_t>(major * 100 + minor * 10);
+}
+
 bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
 {
     Shutdown();
@@ -71,7 +101,7 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
 
     filter_chain_gl_opt_t opts{};
     opts.version = LIBRASHADER_CURRENT_VERSION; // per librashader.h: always set to the current version
-    opts.glsl_version = 330;
+    opts.glsl_version = DetectGlslVersion(loader);
     opts.use_dsa = false;      // keep to GL 3.3, don't require 4.5
     opts.force_no_mipmaps = false;
     opts.disable_cache = false;
@@ -86,7 +116,8 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
     }
 
     _chain = chain;
-    Debug::Printf(kDbgMsg_Info, "librashader: loaded preset '%s'", preset_path.c_str());
+    Debug::Printf(kDbgMsg_Info, "librashader: loaded preset '%s' (GLSL %u)",
+        preset_path.c_str(), static_cast<unsigned>(opts.glsl_version));
     return true;
 }
 
