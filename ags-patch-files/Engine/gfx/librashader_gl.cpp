@@ -99,15 +99,37 @@ bool LibrashaderGL::Frame(uint64_t frame_count,
 
     const libra_instance_t &libra = GetLibra();
 
+    // librashader samples the input frame through sampler objects whose
+    // minification filter may be a mipmapped one. AGS creates its textures
+    // with glTexImage2D and a single level, and the default
+    // GL_TEXTURE_MAX_LEVEL (1000) then makes the texture mipmap-incomplete:
+    // it samples as black and the whole chain outputs black. Restrict the
+    // texture to level 0 (it never has any other level anyway).
+    {
+        GLint prev_active = 0, prev_tex = 0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+        glBindTexture(GL_TEXTURE_2D, in_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
+        glActiveTexture(static_cast<GLenum>(prev_active));
+    }
+
     libra_image_gl_t image{};
     image.handle = in_tex;
-    image.format = GL_RGBA; // matches AGS's own render-target texture format
+    // Must be a SIZED internal format: for presets that keep frame history,
+    // librashader hands it to glTexStorage2D, which rejects the unsized
+    // GL_RGBA (the frame then fails with an incomplete framebuffer).
+    // AGS's own render-target textures are RGBA8.
+    image.format = GL_RGBA8;
     image.width = in_w;
     image.height = in_h;
 
     libra_image_gl_t out{};
     out.handle = out_tex;
-    out.format = GL_RGBA;
+    out.format = GL_RGBA8;
     out.width = out_w;
     out.height = out_h;
 

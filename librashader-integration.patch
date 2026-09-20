@@ -1,5 +1,5 @@
 diff --git a/Engine/CMakeLists.txt b/Engine/CMakeLists.txt
-index 7faa4a2..62c22c3 100644
+index 2f73584..ecfd98b 100644
 --- a/Engine/CMakeLists.txt
 +++ b/Engine/CMakeLists.txt
 @@ -310,6 +310,8 @@ target_sources(engine
@@ -12,7 +12,7 @@ index 7faa4a2..62c22c3 100644
      gfx/gfx_util.cpp
      gfx/gfx_util.h
 diff --git a/Engine/gfx/ali3dogl.cpp b/Engine/gfx/ali3dogl.cpp
-index 1d4ee62..6590a71 100644
+index 1d4ee62..b41e1bc 100644
 --- a/Engine/gfx/ali3dogl.cpp
 +++ b/Engine/gfx/ali3dogl.cpp
 @@ -16,6 +16,7 @@
@@ -70,12 +70,15 @@ index 1d4ee62..6590a71 100644
  #if AGS_PLATFORM_OS_IOS
    // The SDL implementation of the iOS OpenGL view (SDL_uikitopenglview.m) generates its own framebuffer to target the renderbuffer
    // Instead of using framebuffer 0, we ask OpenGL to get the current framebuffer.
-@@ -722,6 +735,52 @@ void OGLGraphicsDriver::SetupViewport()
+@@ -722,6 +735,55 @@ void OGLGraphicsDriver::SetupViewport()
      _filter->GetFilteringForStandardSprite(txfilter, txclamp);
    _screenBackbuffer = BackbufferState(_screenFramebuffer, Size(_mode.Width, _mode.Height), _srcRect.GetSize(),
        viewport, projection, _scaling, txfilter, txclamp);
 +
-+  UpdateLibrashaderTarget(Size(_mode.Width, _mode.Height));
++  // The shaded frame is produced at the size of the area the game occupies on
++  // the screen (_dstRect), so it maps 1:1 onto the viewport and keeps the
++  // game's aspect ratio when the window/screen has a different one.
++  UpdateLibrashaderTarget(_dstRect.GetSize());
 +}
 +
 +void OGLGraphicsDriver::InitLibrashaderIfConfigured()
@@ -123,7 +126,7 @@ index 1d4ee62..6590a71 100644
  }
  
  bool OGLGraphicsDriver::SetDisplayMode(const DisplayMode &mode)
-@@ -847,6 +906,8 @@ void OGLGraphicsDriver::UnInit()
+@@ -847,6 +909,8 @@ void OGLGraphicsDriver::UnInit()
      _nativeSurface = nullptr;
      _nativeBackbuffer = BackbufferState();
    }
@@ -132,7 +135,7 @@ index 1d4ee62..6590a71 100644
  
    DeleteShaderProgram(_transparencyShader);
    DeleteShaderProgram(_tintShader);
-@@ -1184,9 +1245,28 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
+@@ -1184,9 +1248,42 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
  
      if (_doRenderToTexture)
      {
@@ -146,14 +149,28 @@ index 1d4ee62..6590a71 100644
 +            // actual shader/pass/feedback logic lives in librashader; this
 +            // is just handing it two texture ids and reusing AGS's own
 +            // existing textured-quad blit to present the result.
-+            const Size &in_sz = _srcRect.GetSize();
-+            const Size &out_sz = Size(_mode.Width, _mode.Height);
++            const Size in_sz = _srcRect.GetSize();
++            // The target is sized to the destination rect (see SetupViewport)
++            const Size out_sz(_librashaderTarget->GetWidth(), _librashaderTarget->GetHeight());
 +            const bool ok = _librashader->Frame(_librashaderFrameCount++,
 +                _nativeSurface->GetTexture()->_tiles[0].texture, in_sz.Width, in_sz.Height,
 +                _librashaderTarget->GetTexture()->_tiles[0].texture, out_sz.Width, out_sz.Height);
 +            SetBackbufferState(&_screenBackbuffer, true); // librashader unbinds our FBO/state; restore it
-+            RenderTexture(ok ? _librashaderTarget : _nativeSurface, 0, 0, _screenBackbuffer.Projection,
-+                glmex::identity(), SpriteColorTransform(), ok ? out_sz : _srcRect.GetSize());
++            if (ok)
++            {
++                // The shaded frame is already in screen pixels, so draw it with a
++                // projection of its own size: _screenBackbuffer.Projection is a grid
++                // of the game's native size and would show only a corner of it.
++                const glm::mat4 projection =
++                    glm::ortho(0.0f, (float)out_sz.Width, 0.0f, (float)out_sz.Height, 0.0f, 1.0f);
++                RenderTexture(_librashaderTarget, 0, 0, projection, glmex::identity(),
++                    SpriteColorTransform(), out_sz);
++            }
++            else
++            {
++                RenderTexture(_nativeSurface, 0, 0, _screenBackbuffer.Projection, glmex::identity(),
++                    SpriteColorTransform(), _srcRect.GetSize());
++            }
 +        }
 +        else
 +        {
@@ -4448,10 +4465,10 @@ index 0000000..4a64e0b
 +#endif
 diff --git a/Engine/gfx/librashader_gl.cpp b/Engine/gfx/librashader_gl.cpp
 new file mode 100644
-index 0000000..869951e
+index 0000000..16a7251
 --- /dev/null
 +++ b/Engine/gfx/librashader_gl.cpp
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,163 @@
 +//=============================================================================
 +//
 +// Adventure Game Studio (AGS)
@@ -4553,15 +4570,37 @@ index 0000000..869951e
 +
 +    const libra_instance_t &libra = GetLibra();
 +
++    // librashader samples the input frame through sampler objects whose
++    // minification filter may be a mipmapped one. AGS creates its textures
++    // with glTexImage2D and a single level, and the default
++    // GL_TEXTURE_MAX_LEVEL (1000) then makes the texture mipmap-incomplete:
++    // it samples as black and the whole chain outputs black. Restrict the
++    // texture to level 0 (it never has any other level anyway).
++    {
++        GLint prev_active = 0, prev_tex = 0;
++        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
++        glActiveTexture(GL_TEXTURE0);
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
++        glBindTexture(GL_TEXTURE_2D, in_tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
++        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prev_tex));
++        glActiveTexture(static_cast<GLenum>(prev_active));
++    }
++
 +    libra_image_gl_t image{};
 +    image.handle = in_tex;
-+    image.format = GL_RGBA; // matches AGS's own render-target texture format
++    // Must be a SIZED internal format: for presets that keep frame history,
++    // librashader hands it to glTexStorage2D, which rejects the unsized
++    // GL_RGBA (the frame then fails with an incomplete framebuffer).
++    // AGS's own render-target textures are RGBA8.
++    image.format = GL_RGBA8;
 +    image.width = in_w;
 +    image.height = in_h;
 +
 +    libra_image_gl_t out{};
 +    out.handle = out_tex;
-+    out.format = GL_RGBA;
++    out.format = GL_RGBA8;
 +    out.width = out_w;
 +    out.height = out_h;
 +
@@ -4595,7 +4634,7 @@ index 0000000..869951e
 +} // namespace AGS
 diff --git a/Engine/gfx/librashader_gl.h b/Engine/gfx/librashader_gl.h
 new file mode 100644
-index 0000000..7997197
+index 0000000..0dabed3
 --- /dev/null
 +++ b/Engine/gfx/librashader_gl.h
 @@ -0,0 +1,72 @@
