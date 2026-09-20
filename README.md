@@ -95,13 +95,15 @@ NON verificato (serve una macchina vera, con GPU):
   llvmpipe su Xvfb) con un piccolo programma di prova che replica la
   sequenza GL di AGS (texture nativa → librashader → blit) usando il
   bridge vero e un `librashader.so` compilato da master. Da lì sono
-  usciti tre bug, tutti corretti nel patch: la texture di input, con un
+  usciti quattro bug, tutti corretti nel patch: la texture di input, con un
   solo livello mip, risultava incompleta per il sampler di librashader e
   faceva uscire nero l'intera catena; il formato `GL_RGBA` (non
   dimensionato) faceva fallire i preset che usano la history dei frame;
-  e il blit finale usava la proiezione della griglia nativa del gioco
-  per una texture in pixel dello schermo, mostrando solo un angolo
-  ingrandito.
+  il blit finale usava la proiezione della griglia nativa del gioco per
+  una texture in pixel dello schermo, mostrando solo un angolo
+  ingrandito; e la versione GLSL era fissa a 330, per cui i preset che
+  usano funzioni più recenti (es. `packUnorm4x8`, GLSL 4.00) non
+  compilavano: ora si usa la versione massima del contesto GL.
 - Il ramo GLES2 (mobile) di `ali3dogl.cpp`: la patch lo lascia
   sintatticamente intatto (la nuova chiamata è dietro `#if
   !AGS_OPENGL_ES2`) ma non l'ho compilato con quel flag.
