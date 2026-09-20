@@ -1,22 +1,21 @@
 # Makefile per compilare agssetup (C++/Qt6)
-# Opzioni:
-#   make            - Compila con qmake6
-#   make clean      - Pulisce i file generati
-#   make cmake     - Compila con CMake (richiede cmake)
+#   make            - compila con qmake6 (nella cartella build/)
+#   make cmake      - compila con CMake  (nella cartella build-cmake/)
+#   make clean      - rimuove le cartelle di build
+#
+# Nota: qmake genera un proprio "Makefile" nella cartella da cui viene lanciato.
+# Per questo la compilazione avviene in una sottocartella: lanciarlo qui
+# sovrascriverebbe questo file.
 
-.PHONY: all clean cmake
+.PHONY: all cmake clean
 
-all: agssetup
-
-agssetup:
-	qmake6 -project -o agssetup.pro.tmp 2>/dev/null || true
-	qmake6 agssetup.pro
-	$(MAKE) -C $(shell pwd)
-
-clean:
-	rm -rf agssetup.pro.tmp agssetup.o agssetup.moc agssetup Makefile *.o moc_*.cpp
+all:
+	mkdir -p build
+	cd build && qmake6 ../agssetup.pro && $(MAKE)
 
 cmake:
-	mkdir -p build && cd build && cmake .. && make
+	mkdir -p build-cmake
+	cd build-cmake && cmake .. && $(MAKE)
 
-# Fine Makefile
+clean:
+	rm -rf build build-cmake
