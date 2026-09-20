@@ -89,24 +89,30 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   restino byte-per-byte invariate. Il motore vero non è stato eseguito.
 
 NON verificato (serve una macchina vera, con GPU):
-- La compilazione **completa** del motore AGS con CMake (in questo
-  sandbox non c'è una toolchain Rust abbastanza recente per compilare
-  librashader — vedi sotto — quindi non ho potuto linkare/eseguire il
-  motore end-to-end).
-- Il rendering effettivo di un preset (`crt-royale.slangp` o altro) su
-  un gioco reale — nessun output grafico verificabile qui.
+- L'esecuzione del motore AGS vero: la CI lo compila e lo linka, ma io
+  non l'ho mai avviato con un gioco.
+- Il rendering su una GPU vera. Ho verificato solo in software (Mesa
+  llvmpipe su Xvfb) con un piccolo programma di prova che replica la
+  sequenza GL di AGS (texture nativa → librashader → blit) usando il
+  bridge vero e un `librashader.so` compilato da master. Da lì sono
+  usciti tre bug, tutti corretti nel patch: la texture di input, con un
+  solo livello mip, risultava incompleta per il sampler di librashader e
+  faceva uscire nero l'intera catena; il formato `GL_RGBA` (non
+  dimensionato) faceva fallire i preset che usano la history dei frame;
+  e il blit finale usava la proiezione della griglia nativa del gioco
+  per una texture in pixel dello schermo, mostrando solo un angolo
+  ingrandito.
 - Il ramo GLES2 (mobile) di `ali3dogl.cpp`: la patch lo lascia
   sintatticamente intatto (la nuova chiamata è dietro `#if
   !AGS_OPENGL_ES2`) ma non l'ho compilato con quel flag.
 
-## Un limite del mio ambiente, non del progetto
+## Versione minima di Rust
 
-`librashader` ora richiede Rust ≥ 1.85 (edition 2024). Il container in
-cui ho lavorato ha solo Ubuntu 24.04 via apt (rustc 1.75) e non ha
-accesso di rete a rustup.rs per prenderne uno più recente — quindi non
-sono riuscito a compilare `librashader.so` qui per testarlo a runtime.
-Sulla tua macchina CachyOS questo non è un problema: `pacman -S rust`
-installa una versione corrente.
+`librashader` richiede Rust ≥ 1.87 (una sua dipendenza, `naga` 30, si
+rifiuta di compilare con compilatori più vecchi). Su CachyOS basta
+`pacman -S rust`. Su Ubuntu 24.04 il `rustc` di default è troppo vecchio,
+ma `apt install rustc-1.91 cargo-1.91` funziona (i binari stanno in
+`/usr/lib/rust-1.91/bin`).
 
 ## Come procedere sul tuo repo
 

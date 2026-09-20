@@ -6,8 +6,8 @@
 # path (AGS sets no $ORIGIN rpath), so run the engine with LD_LIBRARY_PATH
 # pointing at this folder. agssetup does that automatically.
 #
-# Requires a Rust toolchain >= 1.85 (librashader's dependency tree uses the
-# 2024 edition). On Arch/CachyOS: `sudo pacman -S rust` is current enough.
+# Requires a Rust toolchain >= 1.87 (librashader's dependency tree needs it:
+# naga 30 refuses to build on older compilers). On Arch/CachyOS: `sudo pacman -S rust` is current enough.
 # On Debian/Ubuntu, the distro rustc is usually too old — use rustup
 # (https://rustup.rs) instead.
 set -euo pipefail
@@ -33,13 +33,13 @@ fi
 RUST_VER="$(rustc --version | awk '{print $2}')"
 echo "Using rustc $RUST_VER"
 
-# Check Rust version (librashader requires >= 1.85)
+# Check Rust version (librashader requires >= 1.87)
 RUST_MAJOR=$(echo "$RUST_VER" | cut -d. -f1)
 RUST_MINOR=$(echo "$RUST_VER" | cut -d. -f2)
 RUST_VERSION_NUM=$((RUST_MAJOR * 100 + RUST_MINOR))
 
-if [ "$RUST_VERSION_NUM" -lt 185 ]; then
-  echo "Error: librashader requires Rust >= 1.85 (edition 2024), but found $RUST_VER" >&2
+if [ "$RUST_VERSION_NUM" -lt 187 ]; then
+  echo "Error: librashader requires Rust >= 1.87, but found $RUST_VER" >&2
   echo "Update Rust via rustup: https://rustup.rs" >&2
   exit 1
 fi
