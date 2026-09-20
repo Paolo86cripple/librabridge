@@ -56,13 +56,15 @@ documentazione) per trovare l'punto di aggancio giusto:
    attivo — è esattamente l'immagine "a risoluzione nativa del core" che
    una filter chain in stile RetroArch si aspetta in input.
 3. **Output dello shader.** Viene creata una seconda texture+FBO
-   (`_librashaderTarget`), della dimensione dello schermo, con la STESSA
+   (`_librashaderTarget`), della dimensione dell'area di gioco sullo
+   schermo (`_dstRect`, quindi le proporzioni si mantengono), con la STESSA
    funzione (`CreateRenderTargetDDB`) che AGS già usa per `_nativeSurface`.
    `libra_gl_filter_chain_frame()` scrive lì dentro.
 4. **Presentazione.** Il blit finale che AGS già faceva
-   (`RenderTexture(_nativeSurface, ...)`) viene semplicemente puntato
-   sulla nuova texture quando lo shader è attivo — una sola riga di
-   differenza, zero codice nuovo per il blit stesso.
+   (`RenderTexture(...)`) viene puntato sulla nuova texture quando lo
+   shader è attivo, con una proiezione della dimensione della texture
+   stessa (quella di `_screenBackbuffer` è una griglia della risoluzione
+   nativa del gioco): zero codice nuovo per il blit in sé.
 
 Il vecchio prototipo (LD_PRELOAD + renderchain scritta a mano) doveva
 reimplementare tutta la parte 4 di RetroArch da zero: alias, parametri,
@@ -84,9 +86,15 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   `QT_QPA_PLATFORM=offscreen`) con un motore fittizio al posto di `ags`:
   seleziona un gioco (cartella o file `.ags`), parte dal suo `acsetup.cfg`
   senza modificarlo, salva la config per-gioco, lancia il motore fittizio e
-  verifica argomenti (`--conf <cfg> <gioco>`), cartella di lavoro,
+  verifica argomenti (`--conf <cfg> <gioco> ...`), cartella di lavoro,
   `LD_LIBRARY_PATH` e `AGS_LIBRASHADER_PRESET`, e che le cartelle dei giochi
-  restino byte-per-byte invariate. Il motore vero non è stato eseguito.
+  restino byte-per-byte invariate. Con una config ricca (46 chiavi, anche non
+  gestite e con valori fuori lista) un salvataggio senza modifiche le
+  conserva tutte; cambiando ogni opzione, ognuna finisce nella chiave giusta.
+  Ogni chiave che la GUI scrive è una che il parser del motore
+  (`Engine/main/config.cpp`) legge davvero, e le 29 chiavi che winsetup
+  scrive sono tutte coperte. Il motore vero non è stato eseguito, quindi le
+  voci del menu Diagnostics (`--tell-*`) non sono verificate con esso.
 
 NON verificato (serve una macchina vera, con GPU):
 - L'esecuzione del motore AGS vero: la CI lo compila e lo linka, ma io
@@ -144,7 +152,34 @@ Tienili nella stessa cartella e, se arrivano da uno zip, `chmod +x agssetup`
 2. **Browse...** → *Game folder...* oppure *Game data file...* (`.ags`,
    `.exe`, `ac2game.dat`): i dati di gioco restano dove sono, non vengono
    copiati e nella loro cartella non viene scritto nulla.
-3. Regola grafica, audio e preset shader, poi **Save && Play**.
+3. Regola le opzioni nelle schede, poi **Save && Play**.
+
+Le schede coprono tutto ciò che offre winsetup.exe e altro:
+
+- **Graphics** — monitor, renderer (OpenGL/Software), filtro di scaling,
+  finestra (dimensione e scaling), schermo intero (modo e scaling),
+  refresh, vsync, sprite a risoluzione schermo, antialias, **contatore FPS**.
+- **Shader** — preset librashader, con interruttore per escluderlo senza
+  perdere la selezione.
+- **Audio** — suono, driver, voice pack, cache dei suoni e soglia di
+  caricamento.
+- **Controls** — mouse (blocco automatico, velocità, quando il motore ne
+  prende il controllo, unità della velocità) e touch.
+- **Game** — traduzione (dai `.tra` nella cartella del gioco), cartelle
+  personalizzate per salvataggi e dati condivisi, compressione dei salvataggi,
+  caricamento dell'ultimo salvataggio.
+- **Accessibility** — salto di parlato e testo, velocità di lettura,
+  modalità del parlato, attesa del testo.
+- **Advanced** — cache di sprite e texture, esecuzione in background,
+  compatibilità per giochi vecchi (niente plugin, sistema operativo
+  dichiarato agli script, upscale, gestione tasti nuova), argomenti extra
+  per il motore e chiusura della GUI all'avvio.
+
+Sotto le schede: **Reset to game defaults** ricarica le opzioni dall'`acsetup.cfg`
+del gioco, e **Diagnostics** mostra l'ultimo log del motore o, con le
+opzioni correnti anche non salvate, `--tell-config`, `--tell-data` e
+`--tell-gameproperties`. Le chiavi che la GUI non gestisce restano
+esattamente come erano.
 
 Il gioco parte sempre con l'`ags` che sta accanto ad `agssetup`. Le
 impostazioni sono per-gioco, in `~/.config/agssetup/games/`; la prima volta
