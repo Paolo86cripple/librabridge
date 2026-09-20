@@ -4508,7 +4508,7 @@ index 0000000..869951e
 +    if (!libra.instance_loaded)
 +    {
 +        _lastError = "librashader.so not found, or its ABI does not match this build "
-+                      "(checked next to the engine binary and the system library path)";
++                      "(searched via LD_LIBRARY_PATH and the system library path)";
 +        return false;
 +    }
 +
@@ -4639,10 +4639,10 @@ index 0000000..7997197
 +public:
 +    ~LibrashaderGL() { Shutdown(); }
 +
-+    // Loads librashader.so (searched next to the engine binary first, then
-+    // the system loader path), then loads and compiles the preset at
-+    // preset_path. Returns false (and leaves the object inactive) on any
-+    // failure; AGS falls back to its normal unshaded rendering in that case.
++    // Loads librashader.so (dlopen by bare name: found via LD_LIBRARY_PATH or
++    // the system loader path, not next to the binary), then loads and compiles
++    // the preset at preset_path. Returns false (and leaves the object inactive)
++    // on any failure; AGS falls back to normal unshaded rendering in that case.
 +    bool Init(const std::string &preset_path, GLProcLoader loader);
 +
 +    bool IsActive() const { return _chain != nullptr; }

@@ -27,14 +27,9 @@ using namespace AGS::Common;
 // One process-wide instance of the loaded function table. librashader.so is
 // dlopen'd once on first use and never unloaded (matches how other runtime
 // libraries, e.g. SDL2, glad, are treated elsewhere in the engine).
-// Thread-safe: static local initialization is guaranteed by C++11.
 static libra_instance_t &GetLibra()
 {
     static libra_instance_t s_instance = librashader_load_instance();
-    static bool s_initialized = true;
-    // If load failed, s_instance.instance_loaded will be false
-    // and all calls will gracefully fail below.
-    (void)s_initialized; // silence unused warning
     return s_instance;
 }
 
@@ -59,8 +54,7 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
     if (!libra.instance_loaded)
     {
         _lastError = "librashader.so not found, or its ABI does not match this build "
-                      "(checked next to the engine binary and the system library path). "
-                      "Ensure librashader.so is in the same directory as the engine binary.";
+                      "(searched via LD_LIBRARY_PATH and the system library path)";
         return false;
     }
 
@@ -68,18 +62,8 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
     libra_error_t err = libra.preset_create(preset_path.c_str(), &preset);
     if (err != nullptr || preset == nullptr)
     {
-        std::string errMsg = "failed to parse shader preset: " + preset_path;
-        if (err)
-        {
-            // Capture error message into our string
-            char err_buf[1024];
-            size_t err_len = libra.error_format(err, err_buf, sizeof(err_buf));
-            if (err_len > 0)
-                errMsg += ": ";
-                errMsg += std::string(err_buf, err_len);
-            libra.error_free(&err);
-        }
-        _lastError = errMsg;
+        _lastError = "failed to parse shader preset: " + preset_path;
+        if (err) { libra.error_print(err); libra.error_free(&err); }
         return false;
     }
 
@@ -87,10 +71,7 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
 
     filter_chain_gl_opt_t opts{};
     opts.version = LIBRASHADER_CURRENT_VERSION; // per librashader.h: always set to the current version
-    // GLSL version: 330 is the minimum required by librashader's OpenGL runtime.
-    // Can be overridden via AGS_LIBRASHADER_GLSL_VERSION env var for debugging.
-    const char *glsl_version_env = std::getenv("AGS_LIBRASHADER_GLSL_VERSION");
-    opts.glsl_version = glsl_version_env ? std::stoi(glsl_version_env) : 330;
+    opts.glsl_version = 330;
     opts.use_dsa = false;      // keep to GL 3.3, don't require 4.5
     opts.force_no_mipmaps = false;
     opts.disable_cache = false;
@@ -137,13 +118,7 @@ bool LibrashaderGL::Frame(uint64_t frame_count,
 
     if (err != nullptr)
     {
-        char err_buf[1024];
-        size_t err_len = libra.error_format(err, err_buf, sizeof(err_buf));
-        _lastError = "Filter chain frame error: ";
-        if (err_len > 0)
-            _lastError += std::string(err_buf, err_len);
-        else
-            _lastError += "(unknown error)";
+        libra.error_print(err);
         libra.error_free(&err);
         return false;
     }
@@ -159,19 +134,6 @@ void LibrashaderGL::Shutdown()
         libra.gl_filter_chain_free(&chain);
         _chain = nullptr;
     }
-}
-
-// Static methods
-bool LibrashaderGL::IsLibraryAvailable()
-{
-    return GetLibra().instance_loaded;
-}
-
-std::string LibrashaderGL::GetLibraryPath()
-{
-    // librashader_ld.h doesn't expose the path, but we can try to find it
-    // This is for diagnostics only
-    return "next to engine binary (dlopen path)";
 }
 
 } // namespace OGL

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Builds librashader's C API as a shared library and drops it, correctly
-# named, next to the AGS engine binary so librashader_ld.h's dlopen() call
-# finds it at runtime (no linking step, no changes to the AGS build system).
+# named, next to the AGS engine binary (no linking step, no changes to the AGS
+# build system). librashader_ld.h dlopen()s the bare name "librashader.so",
+# which the loader only finds through LD_LIBRARY_PATH or the system library
+# path (AGS sets no $ORIGIN rpath), so run the engine with LD_LIBRARY_PATH
+# pointing at this folder. agssetup does that automatically.
 #
 # Requires a Rust toolchain >= 1.85 (librashader's dependency tree uses the
 # 2024 edition). On Arch/CachyOS: `sudo pacman -S rust` is current enough.

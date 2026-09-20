@@ -38,21 +38,13 @@ class LibrashaderGL
 public:
     ~LibrashaderGL() { Shutdown(); }
 
-    // Loads librashader.so (searched next to the engine binary first, then
-    // the system loader path), then loads and compiles the preset at
-    // preset_path. Returns false (and leaves the object inactive) on any
-    // failure; AGS falls back to its normal unshaded rendering in that case.
-    // Thread safety: this class is designed for single-threaded use by the
-    // main render thread. Do not call from multiple threads simultaneously.
+    // Loads librashader.so (dlopen by bare name: found via LD_LIBRARY_PATH or
+    // the system loader path, not next to the binary), then loads and compiles
+    // the preset at preset_path. Returns false (and leaves the object inactive)
+    // on any failure; AGS falls back to normal unshaded rendering in that case.
     bool Init(const std::string &preset_path, GLProcLoader loader);
 
     bool IsActive() const { return _chain != nullptr; }
-    
-    // Returns true if librashader.so was successfully loaded (regardless of preset load status)
-    static bool IsLibraryAvailable();
-    
-    // Returns the path where librashader.so was found (for diagnostics)
-    static std::string GetLibraryPath();
 
     // Runs the filter chain: reads from in_tex (in_w x in_h, the game's
     // native-resolution frame) and writes into out_tex (out_w x out_h,
