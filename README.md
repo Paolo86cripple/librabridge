@@ -10,7 +10,7 @@ per le licenze di librashader e AGS.
   `adventuregamestudio/ags`
 - `ags-patch-files/` — le stesse modifiche come file standalone (comodo se
   il patch non applica pulito sulla tua revisione di AGS)
-- `agssetup.py` — GUI di setup (sostituisce winsetup.exe)
+- `agssetup.cpp` — GUI di setup e launcher, C++/Qt6 (sostituisce winsetup.exe)
 - `build_librashader.sh` — compila `librashader.so` da sorgente
 
 ## Cosa c'è qui
@@ -32,8 +32,10 @@ per le licenze di librashader e AGS.
     prima.
 - `build_librashader.sh` — compila `librashader.so` da sorgente (nessun
   binario precompilato incluso).
-- `agssetup.py` — GUI PySide6 che sostituisce winsetup.exe: modifica
-  `acsetup.cfg` e aggiunge un selettore di preset shader.
+- `agssetup.cpp` — GUI C++/Qt6 che sostituisce winsetup.exe e funziona da
+  launcher: si punta a dati di gioco già esistenti con **Browse...**, si
+  regolano grafica/audio/preset shader e si avvia il gioco con il motore
+  compilato in dotazione (vedi "Usare la GUI").
 
 ## Come funziona (l'architettura, non solo il "cosa")
 
@@ -78,12 +80,13 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   dal sorgente Rust reale (`librashader-capi/src/runtime/gl/filter_chain.rs`),
   non dalla sola documentazione (che in un punto è disallineata dal
   codice attuale).
-- `agssetup.py` è stato testato funzionalmente (headless, `QT_QPA_PLATFORM=
-  offscreen`): carica un `acsetup.cfg` vero, modifica campi, salva,
-  rilegge, lancia un eseguibile fittizio e verifica che
-  `AGS_LIBRASHADER_PRESET` arrivi correttamente nell'ambiente del
-  processo figlio. Ho trovato e corretto un bug reale (`QComboBox.
-  findText` con firma sbagliata) proprio grazie a questo test.
+- `agssetup.cpp` è stato testato funzionalmente (headless,
+  `QT_QPA_PLATFORM=offscreen`) con un motore fittizio al posto di `ags`:
+  seleziona un gioco (cartella o file `.ags`), parte dal suo `acsetup.cfg`
+  senza modificarlo, salva la config per-gioco, lancia il motore fittizio e
+  verifica argomenti (`--conf <cfg> <gioco>`), cartella di lavoro,
+  `LD_LIBRARY_PATH` e `AGS_LIBRASHADER_PRESET`, e che le cartelle dei giochi
+  restino byte-per-byte invariate. Il motore vero non è stato eseguito.
 
 NON verificato (serve una macchina vera, con GPU):
 - La compilazione **completa** del motore AGS con CMake (in questo
@@ -117,9 +120,31 @@ git apply /path/to/librashader-integration.patch
 
 Poi lancia un gioco con:
 ```
-AGS_LIBRASHADER_PRESET=/path/a/crt-royale.slangp ./nomegioco
+LD_LIBRARY_PATH=/cartella/con/librashader.so \
+AGS_LIBRASHADER_PRESET=/path/a/crt-royale.slangp ./ags /path/al/gioco
 ```
-oppure usa `agssetup.py <cartella_gioco>` per farlo dal menu.
+oppure usa la GUI (sotto), che imposta tutto da sola.
+
+## Usare la GUI (agssetup)
+
+La CI produce un artifact `ags-librashader-linux-x86_64` con tre file
+affiancati: `ags` (il motore con il bridge), `librashader.so` e `agssetup`.
+Tienili nella stessa cartella e, se arrivano da uno zip, `chmod +x agssetup`
+(l'eseguibile `ags` viene sistemato dalla GUI stessa se serve).
+
+1. Avvia `./agssetup`.
+2. **Browse...** → *Game folder...* oppure *Game data file...* (`.ags`,
+   `.exe`, `ac2game.dat`): i dati di gioco restano dove sono, non vengono
+   copiati e nella loro cartella non viene scritto nulla.
+3. Regola grafica, audio e preset shader, poi **Save && Play**.
+
+Il gioco parte sempre con l'`ags` che sta accanto ad `agssetup`. Le
+impostazioni sono per-gioco, in `~/.config/agssetup/games/`; la prima volta
+partono dall'`acsetup.cfg` del gioco (letto, mai modificato) e da lì in poi il
+motore legge solo il file per-gioco (`--conf`). Nella stessa cartella,
+`<nome>-<hash>.log` contiene l'output dell'ultimo avvio del motore.
+
+Per compilare solo la GUI: `make` (qmake6, in `build/`) oppure `make cmake`.
 
 ## Prossimi passi ragionevoli
 
