@@ -12,7 +12,7 @@ index 2f73584..ecfd98b 100644
      gfx/gfx_util.cpp
      gfx/gfx_util.h
 diff --git a/Engine/gfx/ali3dogl.cpp b/Engine/gfx/ali3dogl.cpp
-index 1d4ee62..b41e1bc 100644
+index 1d4ee62..887e19d 100644
 --- a/Engine/gfx/ali3dogl.cpp
 +++ b/Engine/gfx/ali3dogl.cpp
 @@ -16,6 +16,7 @@
@@ -34,7 +34,7 @@ index 1d4ee62..b41e1bc 100644
    }
  
    if (_doRenderToTexture)
-@@ -276,16 +279,23 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
+@@ -276,16 +279,25 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
    // First setup GL attributes before creating SDL GL window
    if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY) != 0)
      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Error occured setting attribute SDL_GL_CONTEXT_PROFILE_MASK: %s", SDL_GetError());
@@ -53,14 +53,16 @@ index 1d4ee62..b41e1bc 100644
 +  // run on the legacy GL 2.1 context AGS requests by default). We only ask
 +  // for the newer context when a preset is actually configured, so nothing
 +  // changes for players who aren't using shaders.
-+  const bool want_librashader = std::getenv("AGS_LIBRASHADER_PRESET") != nullptr;
++  // Same test as InitLibrashaderIfConfigured(): an empty variable means "no preset".
++  const char *preset_env = std::getenv("AGS_LIBRASHADER_PRESET");
++  const bool want_librashader = preset_env != nullptr && *preset_env != '\0';
 +  if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, want_librashader ? 3 : 2) != 0)
 +    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Error occured setting attribute SDL_GL_CONTEXT_MAJOR_VERSION: %s", SDL_GetError());
 +  if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, want_librashader ? 3 : 1) != 0)
      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Error occured setting attribute SDL_GL_CONTEXT_MINOR_VERSION: %s", SDL_GetError());
  #endif
    // minimum number of bits for the depth buffer
-@@ -332,6 +342,9 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
+@@ -332,6 +344,9 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
  #endif
    _sdlWindow = sdl_window;
    _sdlGlContext = sdlgl_ctx;
@@ -70,7 +72,7 @@ index 1d4ee62..b41e1bc 100644
  #if AGS_PLATFORM_OS_IOS
    // The SDL implementation of the iOS OpenGL view (SDL_uikitopenglview.m) generates its own framebuffer to target the renderbuffer
    // Instead of using framebuffer 0, we ask OpenGL to get the current framebuffer.
-@@ -722,6 +735,55 @@ void OGLGraphicsDriver::SetupViewport()
+@@ -722,6 +737,55 @@ void OGLGraphicsDriver::SetupViewport()
      _filter->GetFilteringForStandardSprite(txfilter, txclamp);
    _screenBackbuffer = BackbufferState(_screenFramebuffer, Size(_mode.Width, _mode.Height), _srcRect.GetSize(),
        viewport, projection, _scaling, txfilter, txclamp);
@@ -126,7 +128,7 @@ index 1d4ee62..b41e1bc 100644
  }
  
  bool OGLGraphicsDriver::SetDisplayMode(const DisplayMode &mode)
-@@ -847,6 +909,8 @@ void OGLGraphicsDriver::UnInit()
+@@ -847,6 +911,8 @@ void OGLGraphicsDriver::UnInit()
      _nativeSurface = nullptr;
      _nativeBackbuffer = BackbufferState();
    }
@@ -135,7 +137,7 @@ index 1d4ee62..b41e1bc 100644
  
    DeleteShaderProgram(_transparencyShader);
    DeleteShaderProgram(_tintShader);
-@@ -1184,9 +1248,42 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
+@@ -1184,9 +1250,42 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
  
      if (_doRenderToTexture)
      {
