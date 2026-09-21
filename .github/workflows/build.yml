@@ -6,24 +6,55 @@ on:
   workflow_dispatch:
     inputs:
       ags_ref:
-        description: 'adventuregamestudio/ags commit/branch to build against (default: master)'
+        description: 'adventuregamestudio/ags branch, tag or commit to build (empty = the pinned revision)'
         required: false
-        default: 'master'
+        default: ''
+      librashader_ref:
+        description: 'SnowflakePowered/librashader branch, tag or commit to build (empty = the pinned revision)'
+        required: false
+        default: ''
   schedule:
-    # Build every day at 2 AM UTC to keep up with AGS master
+    # Nightly canary: builds the TIP of AGS and librashader (both default branches are
+    # called "master") so that an upstream change that breaks the patch or the librashader
+    # ABI is noticed here. It publishes a separate "-canary" artifact.
     - cron: '0 2 * * *'
 
 env:
-  # NB: il branch di default di adventuregamestudio/ags e' "master", non "main".
-  # Puo' essere sovrascritto via workflow_dispatch (branch, tag o commit SHA).
-  # Se cambi questo valore, assicurati che librashader-integration.patch sia compatibile.
-  AGS_REF: ${{ github.event.inputs.ags_ref || 'master' }}
+  # Known-good revisions, used by push and manual runs unless overridden above.
+  # AGS is patched by librashader-integration.patch and librashader's C API is
+  # called through the vendored Engine/gfx/librashader/librashader.h, so the two
+  # have to move together with the patch: to update, bump both here, check that the
+  # patch still applies (git apply --check) and that the build and a game still work.
+  AGS_PINNED: c53a80181f103d34893495686f43f1efd3612fab            # 2026-09-20
+  LIBRASHADER_PINNED: 87e8a97b50516d997defeaa168173dcd185d4022    # 2026-07-04, v0.12.0
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Pick the revisions to build
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_AGS: ${{ github.event.inputs.ags_ref }}
+          INPUT_LIBRASHADER: ${{ github.event.inputs.librashader_ref }}
+        run: |
+          if [ "$EVENT" = "schedule" ]; then
+            ags=master
+            librashader=master
+            artifact=ags-librashader-linux-x86_64-canary
+          else
+            ags="${INPUT_AGS:-$AGS_PINNED}"
+            librashader="${INPUT_LIBRASHADER:-$LIBRASHADER_PINNED}"
+            artifact=ags-librashader-linux-x86_64
+          fi
+          {
+            echo "AGS_REF=$ags"
+            echo "LIBRASHADER_REF=$librashader"
+            echo "ARTIFACT_NAME=$artifact"
+          } >> "$GITHUB_ENV"
+          echo "AGS: $ags | librashader: $librashader | artifact: $artifact"
+
       - name: Checkout librabridge
         uses: actions/checkout@v4
         with:
@@ -53,7 +84,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: SnowflakePowered/librashader
+          ref: ${{ env.LIBRASHADER_REF }}
           path: librashader
+
+      - name: Check that pinned revisions were really checked out
+        run: |
+          for pair in "ags:$AGS_REF" "librashader:$LIBRASHADER_REF"; do
+            dir="${pair%%:*}"; want="${pair#*:}"
+            if [[ "$want" =~ ^[0-9a-f]{40}$ ]]; then
+              got="$(git -C "$dir" rev-parse HEAD)"
+              if [ "$got" != "$want" ]; then
+                echo "::error::$dir is at $got, expected $want"
+                exit 1
+              fi
+            fi
+          done
 
       - name: Build librashader.so (OpenGL runtime only)
         run: |
@@ -96,19 +141,23 @@ jobs:
 
       - name: Collect artifacts
         run: |
-          mkdir -p dist
-          find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} dist/ \;
-          cp librashader/target/release/liblibrashader_capi.so dist/librashader.so
-          cp librabridge/agssetup dist/agssetup
-          # Remove legacy Python script if it exists
-          rm -f dist/agssetup.py
-          # Include AGS commit info in build
-          echo "Built from AGS ${AGS_REF} ($(cd ags && git rev-parse --short HEAD)), librashader $(cd librashader && git rev-parse --short HEAD)" > dist/BUILD_INFO.txt
-          echo "Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> dist/BUILD_INFO.txt
+          pkg=pkg/ags-librashader
+          mkdir -p "$pkg"
+          find ags/build -maxdepth 2 -iname "ags" -type f -executable -exec cp {} "$pkg"/ \;
+          cp librashader/target/release/liblibrashader_capi.so "$pkg/librashader.so"
+          cp librabridge/agssetup "$pkg/agssetup"
+          chmod +x "$pkg/ags" "$pkg/agssetup"   # fails the step if the engine was not found
+          {
+            echo "Built from AGS ${AGS_REF} ($(git -C ags rev-parse --short HEAD)), librashader ${LIBRASHADER_REF} ($(git -C librashader rev-parse --short HEAD))"
+            echo "Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          } > "$pkg/BUILD_INFO.txt"
+          # upload-artifact wraps its input in a zip, and a zip does not keep the executable
+          # bit: ship a tarball, which does.
+          tar -C pkg -czf ags-librashader-linux-x86_64.tar.gz ags-librashader
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: ags-librashader-linux-x86_64
-          path: dist/
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ags-librashader-linux-x86_64.tar.gz
           if-no-files-found: error

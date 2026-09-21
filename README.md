@@ -143,12 +143,32 @@ AGS_LIBRASHADER_PRESET=/path/a/crt-royale.slangp ./ags /path/al/gioco
 ```
 oppure usa la GUI (sotto), che imposta tutto da sola.
 
+## Revisioni fissate e canary notturno
+
+Le build su `push` e quelle lanciate a mano compilano revisioni **fissate** di
+AGS e librashader (`AGS_PINNED` e `LIBRASHADER_PINNED` in
+`.github/workflows/build.yml`): il patch è scritto contro quell'AGS e il bridge
+chiama l'API C di librashader tramite un header copiato nel repo, quindi le due
+cose devono muoversi insieme al patch. Ogni notte la CI compila invece la punta
+di `master` di entrambi e pubblica un artifact separato,
+`ags-librashader-linux-x86_64-canary`: se diventa rosso, qualcosa a monte è
+cambiato (il patch non applica più, o l'ABI di librashader è cambiata) e lo
+vedi prima che ti arrivi una build rotta.
+
+Per aggiornare le revisioni: guarda cosa ha cambiato il canary, verifica che
+`git apply --check librashader-integration.patch` passi sulla nuova revisione di
+AGS (rifacendo il patch se serve) e che la build e un gioco funzionino, poi
+cambia i due SHA nel workflow. Da *Actions → Run workflow* puoi anche compilare
+una revisione qualsiasi senza toccare il file (campi `ags_ref` e `librashader_ref`).
+
 ## Usare la GUI (agssetup)
 
-La CI produce un artifact `ags-librashader-linux-x86_64` con tre file
-affiancati: `ags` (il motore con il bridge), `librashader.so` e `agssetup`.
-Tienili nella stessa cartella e, se arrivano da uno zip, `chmod +x agssetup`
-(l'eseguibile `ags` viene sistemato dalla GUI stessa se serve).
+La CI produce un artifact `ags-librashader-linux-x86_64`: uno zip che contiene
+`ags-librashader-linux-x86_64.tar.gz`. Estrailo con `tar xf` (il tarball conserva
+i permessi di esecuzione, lo zip no) e ottieni la cartella `ags-librashader/` con
+`ags` (il motore con il bridge), `librashader.so`, `agssetup` e `BUILD_INFO.txt`
+(quali revisioni di AGS e librashader sono state compilate). Tieni i file
+insieme nella stessa cartella.
 
 1. Avvia `./agssetup`.
 2. **Browse...** → *Game folder...* oppure *Game data file...* (`.ags`,
