@@ -169,6 +169,12 @@ bool LibrashaderGL::Frame(uint64_t frame_count,
         &chain, static_cast<size_t>(frame_count), image, out,
         /*viewport*/ nullptr, /*mvp*/ nullptr, /*opt*/ nullptr);
 
+    // librashader leaves its last pass's program bound and a higher texture unit
+    // active. AGS's own drawing sets both itself, but hand the context back the
+    // way it found it (AGS keeps no program bound and unit 0 active between draws).
+    glActiveTexture(GL_TEXTURE0);
+    glUseProgram(0);
+
     if (err != nullptr)
     {
         libra.error_print(err);

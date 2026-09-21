@@ -4465,10 +4465,10 @@ index 0000000..4a64e0b
 +#endif
 diff --git a/Engine/gfx/librashader_gl.cpp b/Engine/gfx/librashader_gl.cpp
 new file mode 100644
-index 0000000..edf634a
+index 0000000..6fd8812
 --- /dev/null
 +++ b/Engine/gfx/librashader_gl.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,200 @@
 +//=============================================================================
 +//
 +// Adventure Game Studio (AGS)
@@ -4639,6 +4639,12 @@ index 0000000..edf634a
 +    libra_error_t err = libra.gl_filter_chain_frame(
 +        &chain, static_cast<size_t>(frame_count), image, out,
 +        /*viewport*/ nullptr, /*mvp*/ nullptr, /*opt*/ nullptr);
++
++    // librashader leaves its last pass's program bound and a higher texture unit
++    // active. AGS's own drawing sets both itself, but hand the context back the
++    // way it found it (AGS keeps no program bound and unit 0 active between draws).
++    glActiveTexture(GL_TEXTURE0);
++    glUseProgram(0);
 +
 +    if (err != nullptr)
 +    {
