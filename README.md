@@ -89,8 +89,10 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   verifica argomenti (`--conf <cfg> <gioco> ...`), cartella di lavoro,
   `LD_LIBRARY_PATH` e `AGS_LIBRASHADER_PRESET`, e che le cartelle dei giochi
   restino byte-per-byte invariate. Con una config ricca (46 chiavi, anche non
-  gestite e con valori fuori lista) un salvataggio senza modifiche le
-  conserva tutte; cambiando ogni opzione, ognuna finisce nella chiave giusta.
+  gestite e con valori fuori lista o fuori range) un salvataggio senza
+  modifiche le conserva tutte, e un `acsetup.cfg` in Latin-1 (come quelli dei
+  vecchi giochi Windows) non perde gli accenti; cambiando ogni opzione,
+  ognuna finisce nella chiave giusta.
   Ogni chiave che la GUI scrive è una che il parser del motore
   (`Engine/main/config.cpp`) legge davvero, e le 29 chiavi che winsetup
   scrive sono tutte coperte. Il motore vero non è stato eseguito, quindi le

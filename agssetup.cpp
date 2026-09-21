@@ -65,6 +65,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QRegularExpression>
+#include <QStringConverter>
 #include <QCloseEvent>
 #include <QVector>
 #include <functional>
@@ -87,13 +88,28 @@ class IniFile {
 public:
     bool load(const QString &path) {
         sections.clear();
+        latin1 = false;
         QFile f(path);
-        if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        if (!f.open(QIODevice::ReadOnly))
             return false;
-        QTextStream in(&f);
+        // Config files written by old AGS versions on Windows are in the ANSI
+        // code page, not UTF-8. Decoding those as UTF-8 would replace every
+        // accented character (in a title or, worse, a save folder path) with
+        // U+FFFD when the file is written back. So: UTF-8 if it is valid UTF-8,
+        // otherwise Latin-1, and the file is written back in the same encoding.
+        const QByteArray bytes = f.readAll();
+        QStringDecoder utf8(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+        QString text = utf8(bytes);
+        if (utf8.hasError()) {
+            text = QString::fromLatin1(bytes);
+            latin1 = true;
+        }
+        if (text.startsWith(QChar(0xFEFF)))
+            text.remove(0, 1); // UTF-8 byte order mark
         QString current; // "" = keys found before the first [section]
-        while (!in.atEnd()) {
-            const QString line = in.readLine().trimmed();
+        const QStringList lines = text.split('\n');
+        for (const QString &raw : lines) {
+            const QString line = raw.trimmed();
             if (line.isEmpty() || line.startsWith('#') || line.startsWith(';'))
                 continue;
             if (line.startsWith('[') && line.endsWith(']')) {
@@ -110,18 +126,23 @@ public:
     }
 
     bool save(const QString &path) const {
-        QSaveFile f(path); // atomic: writes a temp file, then renames it
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
-            return false;
-        QTextStream out(&f);
+        QString text;
         for (const Section &s : sections) {
             if (!s.name.isEmpty())
-                out << '[' << s.name << "]\n";
+                text += '[' + s.name + "]\n";
             for (const Entry &e : s.entries)
-                out << e.key << '=' << e.value << '\n';
-            out << '\n';
+                text += e.key + '=' + e.value + '\n';
+            text += '\n';
         }
-        out.flush();
+        // Keep the encoding the file came in, unless something outside it was typed.
+        bool fitsLatin1 = latin1;
+        for (int i = 0; fitsLatin1 && i < text.size(); ++i)
+            if (text.at(i).unicode() > 0xFF)
+                fitsLatin1 = false;
+        QSaveFile f(path); // atomic: writes a temp file, then renames it
+        if (!f.open(QIODevice::WriteOnly))
+            return false;
+        f.write(fitsLatin1 ? text.toLatin1() : text.toUtf8());
         return f.commit();
     }
 
@@ -174,6 +195,7 @@ private:
     struct Entry { QString key; QString value; };
     struct Section { QString name; QVector<Entry> entries; };
     QVector<Section> sections;
+    bool latin1 = false; // the file was not valid UTF-8 and is kept as Latin-1
 
     Section *findSection(const QString &name, bool create) {
         for (Section &s : sections)
@@ -297,6 +319,11 @@ private:
         std::function<QString()> save;             // widget -> config value
     };
     QVector<Binding> bindings;
+    // What each widget said right after the config was loaded into it. A widget
+    // whose value is still that at save time is left alone: the file keeps its
+    // original text even when the widget cannot show it exactly (a mouse speed
+    // above the slider's range, a value hand-written as "ogl", ...).
+    QVector<QString> loadedValues;
 
     // Tool preferences
     QString lastGamePath;
@@ -628,7 +655,9 @@ private:
         bindCheck(vsync, "graphics", "vsync", false);
         f->addRow(vsync);
         renderAtScreenRes = new QCheckBox("Render sprites at screen resolution", this);
-        renderAtScreenRes->setToolTip("Draw sprites at the final screen resolution instead of the game's native one.");
+        renderAtScreenRes->setToolTip("Draw sprites at the final screen resolution instead of the game's native one.\n"
+                                      "Has no effect while a shader preset is in use: shaders always work on the\n"
+                                      "game's native-resolution frame.");
         bindCheck(renderAtScreenRes, "graphics", "render_at_screenres", false);
         f->addRow(renderAtScreenRes);
         antialias = new QCheckBox("Smooth scaled sprites (antialias)", this);
@@ -1095,12 +1124,19 @@ private:
         }
     }
 
+    void snapshotLoadedValues() {
+        loadedValues.clear();
+        for (const Binding &b : bindings)
+            loadedValues.append(b.save());
+    }
+
     // Widgets <- ini
     void populateWidgets() {
         populateLanguages();
         for (const Binding &b : bindings)
             b.load(ini.value(b.section, b.key, b.def));
         updateControlStates();
+        snapshotLoadedValues();
     }
 
     void loadGameConfig() {
@@ -1205,8 +1241,11 @@ private:
 
     // ini <- widgets (into any IniFile, so diagnostics can use a scratch copy)
     void applyWidgetsTo(IniFile &target) const {
-        for (const Binding &b : bindings) {
+        for (int i = 0; i < bindings.size(); ++i) {
+            const Binding &b = bindings[i];
             const QString v = b.save();
+            if (i < loadedValues.size() && v == loadedValues[i] && target.contains(b.section, b.key))
+                continue; // untouched since loading: keep the file's own text
             if (b.omitIfEmpty && v.isEmpty())
                 target.removeValue(b.section, b.key);
             else
@@ -1228,6 +1267,7 @@ private:
             QMessageBox::critical(this, "Save failed", "Could not write:\n" + cfgPath);
             return false;
         }
+        snapshotLoadedValues(); // what is on disk now is the new baseline
         savePreferences();
         return true;
     }
@@ -1373,7 +1413,9 @@ private:
         if (currentGame.isEmpty())
             return;
         bool ok = false;
+        QApplication::setOverrideCursor(Qt::WaitCursor); // the engine is waited for (up to 20 s)
         const QString out = runEngineInfo(tellSwitch, &ok);
+        QApplication::restoreOverrideCursor();
         showText(title + " - " + tellSwitch, out.trimmed().isEmpty() ? "(the engine printed nothing)" : out);
     }
 
