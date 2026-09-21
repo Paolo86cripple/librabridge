@@ -195,13 +195,22 @@ Le schede coprono tutto ciò che offre winsetup.exe e altro:
 - **Advanced** — cache di sprite e texture, esecuzione in background,
   compatibilità per giochi vecchi (niente plugin, sistema operativo
   dichiarato agli script, upscale, gestione tasti nuova), argomenti extra
-  per il motore e chiusura della GUI all'avvio.
+  per il motore, variabili d'ambiente extra (utili per provare opzioni del
+  driver grafico, es. `MESA_GLTHREAD=false`) e chiusura della GUI all'avvio.
 
 Sotto le schede: **Reset to game defaults** ricarica le opzioni dall'`acsetup.cfg`
-del gioco, e **Diagnostics** mostra l'ultimo log del motore o, con le
+del gioco, e **Diagnostics** mostra il riepilogo dell'ultimo avvio (modo
+video realmente impostato, renderer, shader: il posto dove controllare se il
+motore ha davvero preso "Start windowed"), l'ultimo log completo o, con le
 opzioni correnti anche non salvate, `--tell-config`, `--tell-data` e
 `--tell-gameproperties`. Le chiavi che la GUI non gestisce restano
 esattamente come erano.
+
+Una cosa che il motore fa e che sorprende: una dimensione come `x2` per la
+finestra (o `x3` per lo schermo intero) viene usata solo con lo scaling
+"Round". Con "Proportional" o "Stretch" il motore la ignora e apre la finestra
+più grande possibile (`Engine/main/graphics_mode.cpp`, `get_game_frame_from_screen_size`).
+La GUI lo segnala sotto il campo. `native` e `LxA` funzionano con qualsiasi scaling.
 
 Il gioco parte sempre con l'`ags` che sta accanto ad `agssetup`. Le
 impostazioni sono per-gioco, in `~/.config/agssetup/games/`; la prima volta

@@ -357,6 +357,8 @@ private:
     QComboBox *windowScale = nullptr;
     QComboBox *fullscreenMode = nullptr;
     QComboBox *fullscreenScale = nullptr;
+    QLabel *windowNote = nullptr;
+    QLabel *fullscreenNote = nullptr;
     QSpinBox *refresh = nullptr;
     QCheckBox *vsync = nullptr;
     QCheckBox *renderAtScreenRes = nullptr;
@@ -402,6 +404,7 @@ private:
     QCheckBox *upscale = nullptr;
     QCheckBox *newKeys = nullptr;
     QLineEdit *extraArgs = nullptr;
+    QLineEdit *extraEnv = nullptr;
     QCheckBox *closeOnPlayBox = nullptr;
 
     // ----- preferences of the tool -----
@@ -568,6 +571,20 @@ private:
         return box;
     }
 
+    QLabel *makeNote() {
+        QLabel *l = new QLabel(this);
+        l->setWordWrap(true);
+        l->setStyleSheet("color: #b36b00;");
+        l->hide();
+        return l;
+    }
+
+    // "x2", "x3"...: an integer scale factor rather than a size.
+    static bool isScaleFactor(const QString &text) {
+        static const QRegularExpression re("^\\s*[xX]\\d+\\s*$");
+        return re.match(text).hasMatch();
+    }
+
     QComboBox *makeCombo(const QVector<QPair<QString, QString>> &items) {
         QComboBox *c = new QComboBox(this);
         for (const auto &it : items)
@@ -626,6 +643,10 @@ private:
                                  {"Stretch (fill window)", "stretch"}});
         bindCombo(windowScale, "graphics", "game_scale_win", "round");
         f->addRow("Window scaling:", windowScale);
+        windowNote = makeNote();
+        f->addRow(windowNote);
+        connect(windowMode, &QComboBox::currentTextChanged, this, &AGSSetup::updateControlStates);
+        connect(windowScale, &QComboBox::currentIndexChanged, this, &AGSSetup::updateControlStates);
 
         lay->addWidget(makeGroup("Fullscreen", &f));
         fullscreenMode = makeEditableCombo({"default", "full_window", "desktop", "native", "x2", "x3", "x4", "x5", "x6"});
@@ -642,6 +663,10 @@ private:
                                      {"Stretch (fill screen)", "stretch"}});
         bindCombo(fullscreenScale, "graphics", "game_scale_fs", "proportional");
         f->addRow("Fullscreen scaling:", fullscreenScale);
+        fullscreenNote = makeNote();
+        f->addRow(fullscreenNote);
+        connect(fullscreenMode, &QComboBox::currentTextChanged, this, &AGSSetup::updateControlStates);
+        connect(fullscreenScale, &QComboBox::currentIndexChanged, this, &AGSSetup::updateControlStates);
 
         lay->addWidget(makeGroup("Rendering", &f));
         refresh = new QSpinBox(this);
@@ -920,6 +945,14 @@ private:
             [this](const QString &v) { extraArgs->setText(v); },
             [this]() { return extraArgs->text().trimmed(); }});
         f->addRow("Extra engine arguments:", extraArgs);
+        extraEnv = new QLineEdit(this);
+        extraEnv->setPlaceholderText("e.g. MESA_GLTHREAD=false MESA_SHADER_CACHE_DISABLE=true");
+        extraEnv->setToolTip("Environment variables set for the engine, as NAME=VALUE separated by spaces\n"
+                             "(quote a value that contains spaces). Handy for graphics-driver tuning.");
+        bindings.append({"librabridge", "extra_env", QString(), true,
+            [this](const QString &v) { extraEnv->setText(v); },
+            [this]() { return extraEnv->text().trimmed(); }});
+        f->addRow("Extra environment variables:", extraEnv);
         closeOnPlayBox = new QCheckBox("Close this window when the game starts", this);
         closeOnPlayBox->setChecked(closeOnPlay);
         f->addRow(closeOnPlayBox);
@@ -985,6 +1018,8 @@ private:
         connect(resetBtn, &QPushButton::clicked, this, &AGSSetup::resetToGameDefaults);
         QPushButton *diagBtn = new QPushButton("Diagnostics", settingsPane);
         QMenu *diagMenu = new QMenu(diagBtn);
+        connect(diagMenu->addAction("Summary of the last launch (display, renderer, shader)"), &QAction::triggered,
+                this, &AGSSetup::viewLaunchSummary);
         connect(diagMenu->addAction("View last engine log"), &QAction::triggered, this, &AGSSetup::viewLog);
         connect(diagMenu->addAction("Configuration the engine will read (--tell-config)"), &QAction::triggered,
                 this, [this]() { engineInfo("--tell-config", "Engine configuration"); });
@@ -1025,6 +1060,23 @@ private:
         if (!driver || !shaderPane)
             return;
         shaderPane->setEnabled(driver->currentData().toString() == "OGL");
+        // The engine (Engine/main/graphics_mode.cpp) only uses an xN scale factor with the
+        // "Round" scaling style; with Proportional or Stretch it ignores it and sizes the
+        // window/screen from the desktop instead.
+        if (windowNote && fullscreenNote) {
+            const bool winIgnored = isScaleFactor(windowMode->currentText()) &&
+                                    windowScale->currentData().toString() != "round";
+            windowNote->setText(winIgnored ? "Note: a window size like x2 is only used with window scaling "
+                                             "\"Round\". With the other styles the engine ignores it and opens "
+                                             "the largest window that fits the desktop." : QString());
+            windowNote->setVisible(winIgnored);
+            const bool fsIgnored = isScaleFactor(fullscreenMode->currentText()) &&
+                                   fullscreenScale->currentData().toString() != "round";
+            fullscreenNote->setText(fsIgnored ? "Note: a fullscreen mode like x3 is only used with fullscreen "
+                                                "scaling \"Round\". With the other styles the engine ignores it."
+                                              : QString());
+            fullscreenNote->setVisible(fsIgnored);
+        }
         // Slider labels follow valueChanged, which does not fire when a loaded
         // value equals the slider's current one.
         mouseSpeedLabel->setText(QString("%1x").arg(mouseSpeed->value() / 10.0, 0, 'f', 1));
@@ -1286,6 +1338,14 @@ private:
             env.insert("AGS_LIBRASHADER_PRESET", preset);
         else
             env.remove("AGS_LIBRASHADER_PRESET");
+        const QString extra = extraEnv->text().trimmed();
+        if (!extra.isEmpty()) {
+            for (const QString &item : QProcess::splitCommand(extra)) {
+                const int eq = item.indexOf('=');
+                if (eq > 0)
+                    env.insert(item.left(eq), item.mid(eq + 1));
+            }
+        }
         return env;
     }
 
@@ -1375,6 +1435,36 @@ private:
         if (f.size() > keep)
             f.seek(f.size() - keep);
         showText("Engine log - " + logPath, QString::fromUtf8(f.readAll()));
+    }
+
+    // The lines of the last engine log that say what it actually did with the
+    // display: requested settings, the mode it really set, the renderer, the shader.
+    QString launchSummaryText() const {
+        QFile f(logPath);
+        if (logPath.isEmpty() || !f.open(QIODevice::ReadOnly))
+            return "No engine log yet: it is written when the game is started from here.";
+        static const QStringList keep = {
+            "Engine version", "SDL Version", "Located game data", "Game native resolution",
+            "Graphic settings", "Graphics driver set", "Graphics mode set", "Attempt to", "Maximal allowed",
+            "Could not", "Failed", "failed", "Error", "error", "librashader", "OpenGL", "Vendor", "Renderer",
+            "Multitasking", "Setting up window", "Starting game"};
+        QStringList out;
+        const QStringList lines = QString::fromUtf8(f.readAll()).split('\n');
+        for (const QString &line : lines) {
+            const QString t = line.trimmed();
+            for (const QString &k : keep) {
+                if (t.contains(k)) {
+                    out << t;
+                    break;
+                }
+            }
+        }
+        return out.isEmpty() ? QString("The log has none of the expected lines (the engine may not have started).")
+                             : out.join('\n');
+    }
+
+    void viewLaunchSummary() {
+        showText("Last launch - " + logPath, launchSummaryText());
     }
 
     // Runs the engine with one of its --tell-* switches against the CURRENT
