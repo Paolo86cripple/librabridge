@@ -68,7 +68,27 @@
 #include <QStringConverter>
 #include <QCloseEvent>
 #include <QVector>
+#include <QResizeEvent>
 #include <functional>
+
+namespace {
+// A word-wrapping QLabel that keeps enough height for its CURRENT width.
+// QFormLayout does not reliably reserve height for a wrapped label that spans
+// both columns (addRow(QWidget*)): the row can end up shorter than the text
+// needs, clipping the last line against whatever comes after it. Recomputing
+// the label's own minimum height from its width on every resize forces the
+// layout to give it the room it actually needs, and keeps working if the
+// window is resized or the text changes length.
+class WrapLabel : public QLabel {
+public:
+    using QLabel::QLabel;
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QLabel::resizeEvent(event);
+        setMinimumHeight(heightForWidth(qMax(1, width())));
+    }
+};
+} // namespace
 
 namespace {
 
@@ -572,7 +592,7 @@ private:
     }
 
     QLabel *makeNote() {
-        QLabel *l = new QLabel(this);
+        WrapLabel *l = new WrapLabel(this);
         l->setWordWrap(true);
         l->setStyleSheet("color: #b36b00;");
         l->hide();
@@ -1439,6 +1459,9 @@ private:
 
     // The lines of the last engine log that say what it actually did with the
     // display: requested settings, the mode it really set, the renderer, the shader.
+    // Everything this looks for is printed during the engine's startup, so only
+    // the head of the file is read: a long play session (hours, with script
+    // logging enabled) must not make this load the whole log into memory.
     QString launchSummaryText() const {
         QFile f(logPath);
         if (logPath.isEmpty() || !f.open(QIODevice::ReadOnly))
@@ -1449,7 +1472,8 @@ private:
             "Could not", "Failed", "failed", "Error", "error", "librashader", "OpenGL", "Vendor", "Renderer",
             "Multitasking", "Setting up window", "Starting game"};
         QStringList out;
-        const QStringList lines = QString::fromUtf8(f.readAll()).split('\n');
+        const qint64 head = 256 * 1024;
+        const QStringList lines = QString::fromUtf8(f.read(head)).split('\n');
         for (const QString &line : lines) {
             const QString t = line.trimmed();
             for (const QString &k : keep) {
