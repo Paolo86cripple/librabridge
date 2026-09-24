@@ -4673,10 +4673,10 @@ index 0000000..6fd8812
 +} // namespace AGS
 diff --git a/Engine/gfx/librashader_gl.h b/Engine/gfx/librashader_gl.h
 new file mode 100644
-index 0000000..0dabed3
+index 0000000..02f7693
 --- /dev/null
 +++ b/Engine/gfx/librashader_gl.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,71 @@
 +//=============================================================================
 +//
 +// Adventure Game Studio (AGS)
@@ -4740,7 +4740,6 @@ index 0000000..0dabed3
 +
 +private:
 +    void *_chain = nullptr;      // libra_gl_filter_chain_t, opaque here to avoid pulling librashader.h into this header
-+    void *_libHandle = nullptr;  // dlopen handle for librashader.so
 +    std::string _lastError;
 +};
 +

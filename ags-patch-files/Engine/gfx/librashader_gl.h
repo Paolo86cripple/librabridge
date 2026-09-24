@@ -61,7 +61,6 @@ public:
 
 private:
     void *_chain = nullptr;      // libra_gl_filter_chain_t, opaque here to avoid pulling librashader.h into this header
-    void *_libHandle = nullptr;  // dlopen handle for librashader.so
     std::string _lastError;
 };
 
