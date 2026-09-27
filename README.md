@@ -11,6 +11,11 @@ per le licenze di librashader e AGS.
 - `ags-patch-files/` — le stesse modifiche come file standalone (comodo se
   il patch non applica pulito sulla tua revisione di AGS)
 - `agssetup.cpp` — GUI di setup e launcher, C++/Qt6 (sostituisce winsetup.exe)
+- `librashader-capi-headers/` — header C di librashader (vendorizzati, MIT,
+  identici a quelli in `ags-patch-files/`), usati SOLO dalla preview shader di
+  `agssetup.cpp`: la GUI apre `librashader.so` per conto suo, in un processo
+  separato dal motore, per non dover avviare il gioco solo per controllare uno
+  shader
 - `build_librashader.sh` — compila `librashader.so` da sorgente
 
 ## Cosa c'è qui
@@ -97,6 +102,29 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   (`Engine/main/config.cpp`) legge davvero, e le 29 chiavi che winsetup
   scrive sono tutte coperte. Il motore vero non è stato eseguito, quindi le
   voci del menu Diagnostics (`--tell-*`) non sono verificate con esso.
+  Stessa batteria ripetuta per Recent/Profile/Scan a folder/Diagnostics
+  annullabile: `recentGames()` trova il gioco appena salvato, un profilo
+  esportato non contiene il percorso del gioco e riapplicato ripristina
+  esattamente i campi salvati, `looksLikeGame()` distingue correttamente
+  cartelle valide da vuote/inesistenti, e annullare una diagnostica bloccata
+  (motore fittizio che non risponde) interrompe il processo invece di
+  aspettare i 20 secondi. ASan/UBSan puliti su tutti questi percorsi.
+- La **preview shader** è stata provata con un contesto OpenGL vero (Xvfb +
+  `QT_QPA_PLATFORM=xcb`, Mesa software) e lo stesso `librashader.so`
+  compilato da sorgente usato per il resto di questo lavoro: carica preset
+  veri (stock, crt-potato, history, feedback), mostra il messaggio d'errore
+  vero di librashader per un preset non valido (via `libra_error_write`, non
+  solo un messaggio generico), e passare da un preset a un altro nella
+  stessa sessione non lascia artefatti. Da lì sono usciti due bug, corretti:
+  `gl_filter_chain_frame` lascia legati il proprio framebuffer e viewport
+  invece di ripristinare quelli del chiamante, per cui il blit successivo
+  finiva altrove o in un angolo del widget; e su una sessione senza vero
+  supporto OpenGL (riprodotto con `QT_QPA_PLATFORM=offscreen`, dove va in
+  crash perfino un `QOpenGLWidget` vuoto — bug di Qt, non di questo codice)
+  la GUI ora non crea affatto il widget GL, mostrando un messaggio al posto
+  della preview invece di trascinare giù tutta la finestra delle opzioni.
+  Verificato pulito anche sotto ASan/UBSan (un leak riportato è dentro
+  `libdbus`, non nel codice di questo progetto).
 
 NON verificato (serve una macchina vera, con GPU):
 - L'esecuzione del motore AGS vero: la CI lo compila e lo linka, ma io
@@ -171,9 +199,11 @@ i permessi di esecuzione, lo zip no) e ottieni la cartella `ags-librashader/` co
 insieme nella stessa cartella.
 
 1. Avvia `./agssetup`.
-2. **Browse...** → *Game folder...* oppure *Game data file...* (`.ags`,
-   `.exe`, `ac2game.dat`): i dati di gioco restano dove sono, non vengono
-   copiati e nella loro cartella non viene scritto nulla.
+2. **Browse...** → *Game folder...*, *Game data file...* (`.ags`, `.exe`,
+   `ac2game.dat`) oppure *Scan a folder for games...* (utile per una libreria
+   con tanti giochi: cerca nella cartella scelta e un livello sotto, poi fai
+   scegliere quale aprire). **Recent...**, accanto a Browse, riapre in un
+   clic un gioco già configurato prima.
 3. Regola le opzioni nelle schede, poi **Save && Play**.
 
 Le schede coprono tutto ciò che offre winsetup.exe e altro:
@@ -182,7 +212,13 @@ Le schede coprono tutto ciò che offre winsetup.exe e altro:
   finestra (dimensione e scaling), schermo intero (modo e scaling),
   refresh, vsync, sprite a risoluzione schermo, antialias, **contatore FPS**.
 - **Shader** — preset librashader, con interruttore per escluderlo senza
-  perdere la selezione.
+  perdere la selezione, e una **Preview**: un riquadro OpenGL indipendente dal
+  gioco e dal motore (apre `librashader.so` per conto proprio) che applica il
+  preset a un pattern di prova, con **Refresh preview** per aggiornarlo. Utile
+  per controllare che un preset carichi senza dover avviare il gioco; se fallisce
+  mostra l'errore vero e proprio di librashader. Su una sessione senza OpenGL
+  (rarissimo su un desktop reale) la preview si disattiva da sola con un
+  messaggio, invece di piantarsi.
 - **Audio** — suono, driver, voice pack, cache dei suoni e soglia di
   caricamento.
 - **Controls** — mouse (blocco automatico, velocità, quando il motore ne
@@ -198,13 +234,21 @@ Le schede coprono tutto ciò che offre winsetup.exe e altro:
   per il motore, variabili d'ambiente extra (utili per provare opzioni del
   driver grafico, es. `MESA_GLTHREAD=false`) e chiusura della GUI all'avvio.
 
-Sotto le schede: **Reset to game defaults** ricarica le opzioni dall'`acsetup.cfg`
-del gioco, e **Diagnostics** mostra il riepilogo dell'ultimo avvio (modo
-video realmente impostato, renderer, shader: il posto dove controllare se il
-motore ha davvero preso "Start windowed"), l'ultimo log completo o, con le
-opzioni correnti anche non salvate, `--tell-config`, `--tell-data` e
-`--tell-gameproperties`. Le chiavi che la GUI non gestisce restano
-esattamente come erano.
+Sotto le schede:
+
+- **Reset to game defaults** ricarica le opzioni dall'`acsetup.cfg` del gioco.
+- **Profile** — esporta le opzioni correnti (tranne quali gioco sono) su un
+  file per backup o per portarle su un'altra macchina, le importa da un file,
+  oppure le salva come profilo con nome (es. "TV", "monitor con scanline") da
+  riapplicare a qualsiasi gioco in un clic, senza rifare tutti i campi a mano.
+- **Diagnostics** mostra il riepilogo dell'ultimo avvio (modo video realmente
+  impostato, renderer, shader: il posto dove controllare se il motore ha
+  davvero preso "Start windowed"), l'ultimo log completo o, con le opzioni
+  correnti anche non salvate, `--tell-config`, `--tell-data` e
+  `--tell-gameproperties` — con un **Cancel** se il motore non risponde,
+  invece di un'attesa fissa.
+
+Le chiavi che la GUI non gestisce restano esattamente come erano.
 
 Una cosa che il motore fa e che sorprende: una dimensione come `x2` per la
 finestra (o `x3` per lo schermo intero) viene usata solo con lo scaling
