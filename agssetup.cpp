@@ -69,7 +69,19 @@
 #include <QCloseEvent>
 #include <QVector>
 #include <QResizeEvent>
+#include <QListWidget>
+#include <QInputDialog>
+#include <QProgressDialog>
+#include <QEventLoop>
+#include <QTimer>
+#include <QOpenGLWidget>
+#include <QOpenGLFunctions>
+#include <QOpenGLContext>
+#include <QSurfaceFormat>
+#include <QSet>
 #include <functional>
+#include <vector>
+#include <cstring>
 
 namespace {
 // A word-wrapping QLabel that keeps enough height for its CURRENT width.
@@ -302,8 +314,404 @@ QString configDir() {
            "/agssetup/games";
 }
 
+QString profilesDir() {
+    return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) +
+           "/agssetup/profiles";
+}
+
+QString sanitizeFileName(QString name) {
+    name.replace(QRegularExpression("[^A-Za-z0-9 ._-]+"), "_");
+    name = name.trimmed();
+    return name.isEmpty() ? QString("profile") : name.left(60);
+}
+
+// Games configured before: the game_path recorded in every saved *.cfg under
+// configDir(), newest first. Used for a quick "Recent" picker instead of
+// retyping a path already set up once.
+QVector<QPair<QString, QString>> recentGames(int maxCount) { // {display name, path}
+    QVector<QPair<QString, QString>> out;
+    const QFileInfoList files = QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files, QDir::Time);
+    for (const QFileInfo &fi : files) {
+        if (fi.fileName().endsWith(".preview.cfg"))
+            continue;
+        IniFile cfg;
+        if (!cfg.load(fi.absoluteFilePath()))
+            continue;
+        const QString path = cfg.value("librabridge", "game_path");
+        if (path.isEmpty())
+            continue;
+        const QFileInfo gi(path);
+        QString name = gi.isDir() ? gi.fileName() : gi.completeBaseName();
+        if (name.isEmpty())
+            name = path;
+        out.append({name, path});
+        if (out.size() >= maxCount)
+            break;
+    }
+    return out;
+}
+
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Shader preview: builds a librashader filter chain from whatever preset is
+// set and runs it once per "Refresh" on a small built-in test pattern, so a
+// preset can be sanity-checked without launching the whole game. Independent
+// of the game's own Renderer choice (this widget always uses its own OpenGL
+// context) and of the AGS engine: it loads the same shipped librashader.so
+// directly, mirroring what the patched engine does in
+// Engine/gfx/librashader_gl.cpp, but as its own, separate dlopen (agssetup and
+// the engine are different processes).
+#define LIBRA_RUNTIME_OPENGL
+#include "librashader-capi-headers/librashader_ld.h"
+
+namespace {
+
+// One instance for the whole agssetup process (loading it is not free, and
+// nothing about it depends on which preset or game is selected).
+const libra_instance_t &PreviewLibra() {
+    static const libra_instance_t instance = librashader_load_instance();
+    return instance;
+}
+
+// librashader_ld.h's loader expects a plain C function pointer; a context's
+// getProcAddress() is only valid while that context is current, which is true
+// throughout initializeGL()/paintGL() (Qt makes the widget's context current
+// before calling either), matching what the call is used for here.
+const void *QtGLProcLoader(const char *name) {
+    QOpenGLContext *ctx = QOpenGLContext::currentContext();
+    return ctx ? reinterpret_cast<const void *>(ctx->getProcAddress(name)) : nullptr;
+}
+
+} // namespace
+
+class ShaderPreview : public QOpenGLWidget, protected QOpenGLFunctions {
+    Q_OBJECT
+public:
+    explicit ShaderPreview(QWidget *parent = nullptr) : QOpenGLWidget(parent) {
+        setFixedSize(kPreviewW * kPreviewScale, kPreviewH * kPreviewScale);
+        setToolTip("Renders a built-in test pattern through the selected preset.\n"
+                  "Always uses OpenGL here, regardless of the Renderer setting above.");
+    }
+
+    ~ShaderPreview() override {
+        if (!glReady)
+            return; // never had a working context: nothing was ever allocated
+        makeCurrent();
+        destroyChain();
+        if (prog)
+            glDeleteProgram(prog);
+        if (patternTex)
+            glDeleteTextures(1, &patternTex);
+        if (outTex)
+            glDeleteTextures(1, &outTex);
+        doneCurrent();
+    }
+
+    // Queues a (re)build of the filter chain for the given preset; actually
+    // happens on the next paint, when the GL context is guaranteed current.
+    void refresh(const QString &presetPath) {
+        pendingPreset = presetPath;
+        rebuildPending = true;
+        update();
+        if (!glReady)
+            emit statusChanged(); // paintGL() won't run to report this itself
+    }
+
+    QString statusText() const { return status; }
+
+signals:
+    void statusChanged();
+
+protected:
+    void initializeGL() override {
+        // Some sessions (a broken driver, certain remote-desktop setups, or a
+        // platform plugin with no GL support at all) never give this widget a
+        // usable context; Qt may still call the virtual overrides in that case,
+        // and calling any GL function without initializeOpenGLFunctions() having
+        // actually bound one crashes. Every method below checks glReady first.
+        if (!QOpenGLContext::currentContext()) {
+            status = "OpenGL is not available in this session - no preview.";
+            return;
+        }
+        initializeOpenGLFunctions();
+        glReady = true;
+        glClearColor(0.10f, 0.10f, 0.12f, 1.0f);
+        buildProgram();
+        buildPatternTexture();
+        buildOutputTexture();
+        status = "No preset selected - showing the test pattern.";
+    }
+
+    void resizeGL(int, int) override {}
+
+    void paintGL() override {
+        if (!glReady)
+            return;
+        if (rebuildPending) {
+            rebuildPending = false;
+            rebuildChain();
+        }
+
+        glViewport(0, 0, width(), height());
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        GLuint show = patternTex;
+        if (chain) {
+            // Same fix as the engine bridge: a texture with a single mip level is
+            // mipmap-incomplete under the default GL_TEXTURE_MAX_LEVEL, and
+            // librashader's sampler may use a mipmapped filter.
+            glBindTexture(GL_TEXTURE_2D, patternTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+
+            libra_image_gl_t image{};
+            image.handle = patternTex;
+            image.format = GL_RGBA8;
+            image.width = kPreviewW;
+            image.height = kPreviewH;
+            libra_image_gl_t out{};
+            out.handle = outTex;
+            out.format = GL_RGBA8;
+            out.width = kPreviewW;
+            out.height = kPreviewH;
+
+            auto chainHandle = static_cast<libra_gl_filter_chain_t>(chain);
+            // Presets using frame history/feedback look wrong (often just black)
+            // on their very first frame; run a few extra ones once, right after a
+            // rebuild, so what gets shown is closer to the shader's steady state.
+            const int extraFrames = justRebuilt ? 15 : 0;
+            justRebuilt = false;
+            libra_error_t err = nullptr;
+            for (int i = 0; i <= extraFrames; ++i) {
+                err = PreviewLibra().gl_filter_chain_frame(
+                    &chainHandle, frameCount++, image, out, nullptr, nullptr, nullptr);
+                if (err)
+                    break;
+            }
+            // librashader binds its own framebuffer and sets its own viewport while
+            // rendering into outTex, and does not restore either afterwards; without
+            // this, the blit below lands on the wrong target/area and the widget
+            // shows a partial or blank result.
+            glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+            glViewport(0, 0, width(), height());
+            glActiveTexture(GL_TEXTURE0); // hand the context back, same as the engine bridge
+            glUseProgram(0);
+            if (err) {
+                setStatus("Frame error: " + describeError(err) + " (falling back to the plain pattern).");
+                destroyChain();
+            } else {
+                show = outTex;
+            }
+        }
+        drawTexturedQuad(show);
+    }
+
+private:
+    static constexpr int kPreviewW = 320, kPreviewH = 180, kPreviewScale = 2;
+
+    QString pendingPreset, currentPreset, status;
+    bool rebuildPending = false;
+    bool justRebuilt = false; // run a few extra frames once so history/feedback shaders settle
+    bool glReady = false; // false if this session never gave the widget a working GL context
+    void *chain = nullptr; // opaque libra_gl_filter_chain_t, kept as void* so this
+                           // header does not have to be included outside this file
+    quint64 frameCount = 0;
+    GLuint prog = 0, aPos = 0, aUV = 0, uTex = 0, patternTex = 0, outTex = 0, quadVbo = 0;
+
+    void setStatus(const QString &text) {
+        status = text;
+        emit statusChanged();
+    }
+
+    // librashader's own message for an error, freed right after reading it.
+    // Falls back to a generic line if the vendored build lacks error_write
+    // (older ABI) or returns nothing.
+    QString describeError(libra_error_t err) {
+        QString text;
+        char *msg = nullptr;
+        if (PreviewLibra().error_write && PreviewLibra().error_write(err, &msg) == 0 && msg) {
+            text = QString::fromUtf8(msg);
+            if (PreviewLibra().error_free_string)
+                PreviewLibra().error_free_string(&msg);
+        }
+        if (PreviewLibra().error_free)
+            PreviewLibra().error_free(&err);
+        return text.isEmpty() ? "unknown error" : text;
+    }
+
+    void destroyChain() {
+        if (!chain)
+            return;
+        auto chainHandle = static_cast<libra_gl_filter_chain_t>(chain);
+        PreviewLibra().gl_filter_chain_free(&chainHandle);
+        chain = nullptr;
+    }
+
+    static uint16_t detectGlslVersion(const QSurfaceFormat &fmt) {
+        const int major = fmt.majorVersion(), minor = fmt.minorVersion();
+        if (major < 3 || (major == 3 && minor < 3))
+            return 330; // librashader's minimum
+        if (major > 4 || (major == 4 && minor > 6))
+            return 460;
+        return static_cast<uint16_t>(major * 100 + minor * 10);
+    }
+
+    void rebuildChain() {
+        destroyChain();
+        currentPreset = pendingPreset;
+        frameCount = 0;
+        justRebuilt = true;
+
+        if (currentPreset.isEmpty()) {
+            setStatus("No preset selected - showing the test pattern.");
+            return;
+        }
+        if (!QFileInfo::exists(currentPreset)) {
+            setStatus("The preset file does not exist:\n" + currentPreset);
+            return;
+        }
+        const libra_instance_t &libra = PreviewLibra();
+        if (!libra.instance_loaded) {
+            setStatus("librashader.so was not found next to agssetup.");
+            return;
+        }
+
+        libra_shader_preset_t preset = nullptr;
+        libra_error_t err = libra.preset_create(currentPreset.toUtf8().constData(), &preset);
+        if (err || !preset) {
+            setStatus(err ? "Could not parse the preset: " + describeError(err)
+                         : "Could not parse the preset.");
+            return;
+        }
+
+        filter_chain_gl_opt_t opts{};
+        opts.version = LIBRASHADER_CURRENT_VERSION;
+        opts.glsl_version = detectGlslVersion(format());
+        opts.use_dsa = false;
+        opts.force_no_mipmaps = false;
+        opts.disable_cache = false;
+
+        libra_gl_filter_chain_t newChain = nullptr;
+        err = libra.gl_filter_chain_create(&preset, &QtGLProcLoader, &opts, &newChain);
+        if (err || !newChain) {
+            setStatus(QString("Failed to build the filter chain (GLSL %1): ").arg(opts.glsl_version) +
+                     (err ? describeError(err) : QString("unknown error")));
+            return;
+        }
+        chain = newChain;
+        setStatus(QString("Loaded - GLSL %1.").arg(opts.glsl_version));
+    }
+
+    GLuint compileShader(GLenum type, const char *src) {
+        GLuint s = glCreateShader(type);
+        glShaderSource(s, 1, &src, nullptr);
+        glCompileShader(s);
+        return s;
+    }
+
+    void buildProgram() {
+        static const char *vs =
+            "#version 120\n"
+            "attribute vec2 aPosIn;\nattribute vec2 aUVIn;\nvarying vec2 vUV;\n"
+            "void main(){ vUV=aUVIn; gl_Position=vec4(aPosIn,0.0,1.0); }\n";
+        static const char *fs =
+            "#version 120\n"
+            "varying vec2 vUV;\nuniform sampler2D tex;\n"
+            "void main(){ gl_FragColor = texture2D(tex, vUV); }\n";
+        GLuint v = compileShader(GL_VERTEX_SHADER, vs);
+        GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
+        prog = glCreateProgram();
+        glAttachShader(prog, v);
+        glAttachShader(prog, f);
+        glLinkProgram(prog);
+        glDeleteShader(v);
+        glDeleteShader(f);
+        aPos = glGetAttribLocation(prog, "aPosIn");
+        aUV = glGetAttribLocation(prog, "aUVIn");
+        uTex = glGetUniformLocation(prog, "tex");
+
+        static const float quad[] = {
+            // x,    y,     u,   v
+            -1.f, -1.f,  0.f, 0.f,
+             1.f, -1.f,  1.f, 0.f,
+            -1.f,  1.f,  0.f, 1.f,
+             1.f,  1.f,  1.f, 1.f,
+        };
+        glGenBuffers(1, &quadVbo);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    void drawTexturedQuad(GLuint tex) {
+        glUseProgram(prog);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
+        glEnableVertexAttribArray(aPos);
+        glEnableVertexAttribArray(aUV);
+        glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<void *>(0));
+        glVertexAttribPointer(aUV, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<void *>(2 * sizeof(float)));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glUniform1i(uTex, 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray(aPos);
+        glDisableVertexAttribArray(aUV);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+    }
+
+    // A small pattern with a marker in each corner, useful to tell orientation
+    // and scaling apart at a glance. Generated top-down, then flipped into
+    // OpenGL's bottom-up texture row order on upload.
+    void buildPatternTexture() {
+        std::vector<unsigned char> img(kPreviewW * kPreviewH * 4);
+        auto put = [&](int x, int y, int r, int g, int b) {
+            if (x < 0 || y < 0 || x >= kPreviewW || y >= kPreviewH)
+                return;
+            unsigned char *p = &img[(y * kPreviewW + x) * 4];
+            p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
+        };
+        for (int y = 0; y < kPreviewH; ++y)
+            for (int x = 0; x < kPreviewW; ++x)
+                put(x, y, 30, 40 + y * 110 / kPreviewH, 140);
+        const int mw = kPreviewW / 8, mh = kPreviewH / 8;
+        for (int y = 0; y < mh; ++y) {
+            for (int x = 0; x < mw; ++x) {
+                put(x, y, 255, 0, 0);
+                put(kPreviewW - 1 - x, y, 255, 255, 0);
+                put(x, kPreviewH - 1 - y, 255, 0, 255);
+                put(kPreviewW - 1 - x, kPreviewH - 1 - y, 0, 255, 0);
+            }
+        }
+        for (int x = 0; x < kPreviewW; ++x) put(x, kPreviewH / 2, 255, 255, 255);
+        for (int y = 0; y < kPreviewH; ++y) put(kPreviewW / 2, y, 255, 255, 255);
+
+        std::vector<unsigned char> flipped(img.size());
+        for (int y = 0; y < kPreviewH; ++y)
+            memcpy(&flipped[(kPreviewH - 1 - y) * kPreviewW * 4], &img[y * kPreviewW * 4], kPreviewW * 4);
+
+        glGenTextures(1, &patternTex);
+        glBindTexture(GL_TEXTURE_2D, patternTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kPreviewW, kPreviewH, 0, GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+    }
+
+    void buildOutputTexture() {
+        glGenTextures(1, &outTex);
+        glBindTexture(GL_TEXTURE_2D, outTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kPreviewW, kPreviewH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+};
 
 class AGSSetup : public QWidget {
     Q_OBJECT
@@ -388,6 +796,8 @@ private:
     QCheckBox *shaderEnabled = nullptr;
     QLineEdit *shaderPath = nullptr;
     QWidget *shaderPane = nullptr;
+    ShaderPreview *shaderPreview = nullptr;
+    WrapLabel *previewStatus = nullptr;
 
     QCheckBox *soundEnabled = nullptr;
     QComboBox *audioDriver = nullptr;
@@ -756,6 +1166,53 @@ private:
         note->setWordWrap(true);
         sl->addWidget(note);
 
+        QGroupBox *previewBox = new QGroupBox("Preview", this);
+        QVBoxLayout *pl = new QVBoxLayout(previewBox);
+        // A few Qt platform plugins (offscreen, minimal - used for automated
+        // testing and some minimal/headless setups, never a real desktop
+        // session) have no OpenGL support at all; QOpenGLWidget does not
+        // degrade gracefully on those; skip creating one rather than risk it.
+        static const QSet<QString> noGlPlatforms = {"offscreen", "minimal"};
+        if (noGlPlatforms.contains(QGuiApplication::platformName())) {
+            QLabel *unavailable = new QLabel(
+                "Preview unavailable: this session (\"" + QGuiApplication::platformName() +
+                "\") has no OpenGL support.", previewBox);
+            unavailable->setWordWrap(true);
+            unavailable->setAlignment(Qt::AlignHCenter);
+            pl->addWidget(unavailable);
+            sl->addWidget(previewBox);
+            lay->addWidget(shaderPane);
+            lay->addStretch(1);
+            return page;
+        }
+        QHBoxLayout *previewRow = new QHBoxLayout();
+        shaderPreview = new ShaderPreview(previewBox);
+        previewRow->addStretch(1);
+        previewRow->addWidget(shaderPreview);
+        previewRow->addStretch(1);
+        pl->addLayout(previewRow);
+        previewStatus = new WrapLabel(previewBox);
+        previewStatus->setWordWrap(true);
+        previewStatus->setAlignment(Qt::AlignHCenter);
+        previewStatus->setText("Not checked yet - press Refresh preview.");
+        pl->addWidget(previewStatus);
+        QPushButton *previewRefreshBtn = new QPushButton("Refresh preview", previewBox);
+        previewRefreshBtn->setToolTip("Runs the preset above on a built-in test pattern, so it can be\n"
+                                      "sanity-checked without starting the game. Does not update on its\n"
+                                      "own when the preset field changes.");
+        connect(previewRefreshBtn, &QPushButton::clicked, this, [this]() {
+            shaderPreview->refresh(shaderPath->text().trimmed());
+        });
+        connect(shaderPreview, &ShaderPreview::statusChanged, this, [this]() {
+            previewStatus->setText(shaderPreview->statusText());
+        });
+        QHBoxLayout *btnRow = new QHBoxLayout();
+        btnRow->addStretch(1);
+        btnRow->addWidget(previewRefreshBtn);
+        btnRow->addStretch(1);
+        pl->addLayout(btnRow);
+        sl->addWidget(previewBox);
+
         lay->addWidget(shaderPane);
         lay->addStretch(1);
         return page;
@@ -995,12 +1452,33 @@ private:
         QMenu *browseMenu = new QMenu(browseGameBtn);
         QAction *pickFile = browseMenu->addAction("Game data file (.ags, .exe, ac2game.dat)...");
         QAction *pickDir = browseMenu->addAction("Game folder...");
+        QAction *pickScan = browseMenu->addAction("Scan a folder for games...");
         connect(pickFile, &QAction::triggered, this, &AGSSetup::browseGameFile);
         connect(pickDir, &QAction::triggered, this, &AGSSetup::browseGameFolder);
+        connect(pickScan, &QAction::triggered, this, &AGSSetup::scanFolderForGames);
         browseGameBtn->setMenu(browseMenu);
         connect(gamePath, &QLineEdit::editingFinished, this, &AGSSetup::onGamePathEdited);
+
+        QPushButton *recentBtn = new QPushButton("Recent...", this);
+        QMenu *recentMenu = new QMenu(recentBtn);
+        connect(recentMenu, &QMenu::aboutToShow, this, [this, recentMenu]() {
+            recentMenu->clear();
+            const auto games = recentGames(15);
+            if (games.isEmpty()) {
+                recentMenu->addAction("(no configured games yet)")->setEnabled(false);
+            } else {
+                for (const auto &g : games) {
+                    QAction *a = recentMenu->addAction(g.first + "   " + g.second);
+                    const QString path = g.second;
+                    connect(a, &QAction::triggered, this, [this, path]() { selectGame(path); });
+                }
+            }
+        });
+        recentBtn->setMenu(recentMenu);
+
         gameRow->addWidget(gamePath, 1);
         gameRow->addWidget(browseGameBtn);
+        gameRow->addWidget(recentBtn);
         gameLayout->addLayout(gameRow);
 
         gameStatus = new QLabel(this);
@@ -1036,6 +1514,30 @@ private:
         resetBtn->setToolTip("Reload the options from the game's own acsetup.cfg (or the defaults).\n"
                              "Nothing is saved until you press Save.");
         connect(resetBtn, &QPushButton::clicked, this, &AGSSetup::resetToGameDefaults);
+        QPushButton *profileBtn = new QPushButton("Profile", settingsPane);
+        QMenu *profileMenu = new QMenu(profileBtn);
+        connect(profileMenu, &QMenu::aboutToShow, this, [this, profileMenu]() {
+            profileMenu->clear();
+            profileMenu->addAction("Export settings to file...", this, &AGSSetup::exportSettings);
+            profileMenu->addAction("Import settings from file...", this, &AGSSetup::importSettings);
+            profileMenu->addSeparator();
+            profileMenu->addAction("Save current settings as profile...", this, &AGSSetup::saveAsProfile);
+            const QStringList names = listProfiles();
+            if (names.isEmpty()) {
+                profileMenu->addAction("(no saved profiles yet)")->setEnabled(false);
+            } else {
+                for (const QString &name : names) {
+                    QAction *a = profileMenu->addAction("Apply \"" + name + "\"");
+                    connect(a, &QAction::triggered, this, [this, name]() { applyProfile(name); });
+                }
+                profileMenu->addSeparator();
+                profileMenu->addAction("Delete profile...", this, &AGSSetup::deleteProfile);
+            }
+        });
+        profileBtn->setMenu(profileMenu);
+        profileBtn->setToolTip("A profile is a saved set of options (graphics, shader, ...) that can be\n"
+                               "applied to any game, or exported to a file to share or back up.");
+
         QPushButton *diagBtn = new QPushButton("Diagnostics", settingsPane);
         QMenu *diagMenu = new QMenu(diagBtn);
         connect(diagMenu->addAction("Summary of the last launch (display, renderer, shader)"), &QAction::triggered,
@@ -1049,6 +1551,7 @@ private:
                 this, [this]() { engineInfo("--tell-gameproperties", "Game properties"); });
         diagBtn->setMenu(diagMenu);
         toolRow->addWidget(resetBtn);
+        toolRow->addWidget(profileBtn);
         toolRow->addWidget(diagBtn);
         toolRow->addStretch(1);
         paneLayout->addLayout(toolRow);
@@ -1278,6 +1781,70 @@ private:
         selectGame(d);
     }
 
+    // Looks for game data directly under a folder and, one level further down
+    // (a common layout for game libraries: Library/GameName/GameName/data),
+    // then lets the user pick one. Bounded to keep a scan of a big media
+    // drive from taking forever.
+    void scanFolderForGames() {
+        const QString root = QFileDialog::getExistingDirectory(
+            this, "Choose a folder to scan for games", browseStartDir(),
+            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+        if (root.isEmpty())
+            return;
+
+        const int maxResults = 200;
+        QVector<QPair<QString, QString>> found; // {display name, path}
+        QString why;
+        if (looksLikeGame(root, &why))
+            found.append({QFileInfo(root).fileName(), root});
+        const QFileInfoList level1 = QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+        for (const QFileInfo &d1 : level1) {
+            if (found.size() >= maxResults)
+                break;
+            QString w1;
+            if (looksLikeGame(d1.absoluteFilePath(), &w1)) {
+                found.append({d1.fileName(), d1.absoluteFilePath()});
+                continue; // don't also descend into a folder that is itself a game
+            }
+            const QFileInfoList level2 = QDir(d1.absoluteFilePath()).entryInfoList(
+                QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+            for (const QFileInfo &d2 : level2) {
+                if (found.size() >= maxResults)
+                    break;
+                QString w2;
+                if (looksLikeGame(d2.absoluteFilePath(), &w2))
+                    found.append({d1.fileName(), d2.absoluteFilePath()});
+            }
+        }
+
+        if (found.isEmpty()) {
+            QMessageBox::information(this, "No games found",
+                                     "No AGS game data was found directly under, or one level under:\n" + root);
+            return;
+        }
+
+        QDialog dlg(this);
+        dlg.setWindowTitle(found.size() >= maxResults ? "Choose a game (stopped at 200 results)" : "Choose a game");
+        QVBoxLayout *l = new QVBoxLayout(&dlg);
+        QListWidget *list = new QListWidget(&dlg);
+        for (const auto &g : found) {
+            QListWidgetItem *item = new QListWidgetItem(g.first + "    " + g.second, list);
+            item->setData(Qt::UserRole, g.second);
+        }
+        list->setCurrentRow(0);
+        l->addWidget(list, 1);
+        QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        connect(list, &QListWidget::itemDoubleClicked, &dlg, &QDialog::accept);
+        l->addWidget(bb);
+        dlg.resize(560, 420);
+        if (dlg.exec() == QDialog::Accepted && list->currentItem()) {
+            lastGameDir = QFileInfo(root).absoluteFilePath();
+            selectGame(list->currentItem()->data(Qt::UserRole).toString());
+        }
+    }
+
     QString shaderStartDir() const {
         if (!lastShaderDir.isEmpty())
             return lastShaderDir;
@@ -1307,6 +1874,117 @@ private:
             shaderPath->setText(path);
             lastShaderDir = QFileInfo(path).path();
         }
+    }
+
+    // ----- settings profiles: export/import to an arbitrary file, or save/apply
+    // a named one kept under profilesDir(). Both share the same underlying
+    // "copy every bound key" logic; the game path is never part of a profile,
+    // since a profile is meant to be reusable across different games. -----
+
+    // Everything the current widgets would write, EXCEPT which game it is for.
+    IniFile currentSettingsAsProfile() const {
+        IniFile out;
+        applyWidgetsTo(out);
+        out.removeValue("librabridge", "game_path");
+        return out;
+    }
+
+    // Copies only the keys PRESENT in `from` into `ini` (so a profile that
+    // predates a newer option, or one that was deliberately trimmed down, does
+    // not clobber options it says nothing about), then reloads the widgets.
+    void applyProfileFile(const IniFile &from, const QString &statusLine) {
+        for (const Binding &b : bindings)
+            if (from.contains(b.section, b.key))
+                ini.setValue(b.section, b.key, from.value(b.section, b.key));
+        normalizeLegacyValues();
+        populateWidgets();
+        gameStatus->setText(statusLine + "\nNot saved yet.");
+    }
+
+    void exportSettings() {
+        if (currentGame.isEmpty())
+            return;
+        const QString path = QFileDialog::getSaveFileName(
+            this, "Export settings to file", QDir::homePath() + "/shader-profile.cfg",
+            "AGS Setup profile (*.cfg);;All files (*)");
+        if (path.isEmpty())
+            return;
+        if (!currentSettingsAsProfile().save(path))
+            QMessageBox::critical(this, "Export failed", "Could not write:\n" + path);
+    }
+
+    void importSettings() {
+        if (currentGame.isEmpty())
+            return;
+        const QString path = QFileDialog::getOpenFileName(
+            this, "Import settings from file", QDir::homePath(),
+            "AGS Setup profile (*.cfg);;All files (*)");
+        if (path.isEmpty())
+            return;
+        IniFile in;
+        if (!in.load(path)) {
+            QMessageBox::critical(this, "Import failed", "Could not read:\n" + path);
+            return;
+        }
+        applyProfileFile(in, "Settings imported from " + path + ".");
+    }
+
+    QStringList listProfiles() const {
+        QStringList names;
+        for (const QFileInfo &fi : QDir(profilesDir()).entryInfoList({"*.cfg"}, QDir::Files, QDir::Name))
+            names << fi.completeBaseName();
+        return names;
+    }
+
+    void saveAsProfile() {
+        if (currentGame.isEmpty())
+            return;
+        bool ok = false;
+        const QString typed = QInputDialog::getText(this, "Save as profile", "Profile name:",
+                                                     QLineEdit::Normal, QString(), &ok).trimmed();
+        if (!ok || typed.isEmpty())
+            return;
+        const QString name = sanitizeFileName(typed);
+        if (!QDir().mkpath(profilesDir())) {
+            QMessageBox::critical(this, "Save failed", "Could not create:\n" + profilesDir());
+            return;
+        }
+        const QString path = QDir(profilesDir()).filePath(name + ".cfg");
+        if (QFile::exists(path) && QMessageBox::question(this, "Replace profile",
+                "A profile named \"" + name + "\" already exists. Replace it?") != QMessageBox::Yes)
+            return;
+        if (!currentSettingsAsProfile().save(path))
+            QMessageBox::critical(this, "Save failed", "Could not write:\n" + path);
+    }
+
+    void applyProfile(const QString &name) {
+        IniFile in;
+        if (!in.load(QDir(profilesDir()).filePath(name + ".cfg"))) {
+            QMessageBox::warning(this, "Profile not found", "Could not read the profile \"" + name + "\".");
+            return;
+        }
+        if (QMessageBox::question(this, "Apply profile",
+                "Apply profile \"" + name + "\" to the current game?\n"
+                "Options it sets will be overwritten (not saved to disk until you press Save).") != QMessageBox::Yes)
+            return;
+        applyProfileFile(in, "Profile \"" + name + "\" applied.");
+    }
+
+    void deleteProfile() {
+        const QStringList names = listProfiles();
+        if (names.isEmpty()) {
+            QMessageBox::information(this, "No profiles", "There are no saved profiles yet.");
+            return;
+        }
+        bool ok = false;
+        const QString name = QInputDialog::getItem(this, "Delete profile", "Profile:", names, 0, false, &ok);
+        if (!ok || name.isEmpty())
+            return;
+        if (QMessageBox::question(this, "Delete profile",
+                "Delete profile \"" + name + "\"? This cannot be undone.") != QMessageBox::Yes)
+            return;
+        if (!QFile::remove(QDir(profilesDir()).filePath(name + ".cfg")))
+            QMessageBox::critical(this, "Delete failed", "Could not delete the profile \"" + name + "\".");
     }
 
     // ----- saving -----
@@ -1493,7 +2171,10 @@ private:
 
     // Runs the engine with one of its --tell-* switches against the CURRENT
     // (possibly unsaved) options and returns what it printed. Nothing is
-    // launched: these switches print and exit.
+    // launched: these switches print and exit. Pumps events (via a local
+    // QEventLoop, not a blocking wait) while a cancellable progress dialog is
+    // shown, so the GUI stays responsive and a stuck engine can be stopped
+    // instead of forcing a fixed 20-second wait.
     QString runEngineInfo(const QString &tellSwitch, bool *ok) {
         *ok = false;
         QString err;
@@ -1514,11 +2195,34 @@ private:
         proc.start(engine, {"--conf", previewPath, tellSwitch, currentGame});
         if (!proc.waitForStarted(5000))
             return "Could not start the engine: " + proc.errorString();
-        if (!proc.waitForFinished(20000)) {
+
+        QProgressDialog wait("Waiting for the engine...", "Cancel", 0, 0, this);
+        wait.setWindowModality(Qt::WindowModal);
+        wait.setMinimumDuration(0);
+        wait.setAutoClose(false);
+        wait.setAutoReset(false);
+
+        QEventLoop loop;
+        bool cancelled = false, timedOut = false;
+        QTimer timeoutTimer;
+        timeoutTimer.setSingleShot(true);
+        connect(&timeoutTimer, &QTimer::timeout, &loop, [&]() { timedOut = true; loop.quit(); });
+        connect(&proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), &loop, &QEventLoop::quit);
+        connect(&proc, &QProcess::errorOccurred, &loop, &QEventLoop::quit);
+        connect(&wait, &QProgressDialog::canceled, &loop, [&]() { cancelled = true; loop.quit(); });
+
+        wait.show(); // don't rely on QProgressDialog's own auto-show timing heuristic
+        timeoutTimer.start(20000);
+        loop.exec();
+
+        if (proc.state() != QProcess::NotRunning) {
             proc.kill();
             proc.waitForFinished(2000);
-            return QString::fromUtf8(proc.readAll()) + "\n[stopped after 20 seconds]";
         }
+        if (cancelled)
+            return "Cancelled.";
+        if (timedOut)
+            return QString::fromUtf8(proc.readAll()) + "\n[stopped after 20 seconds]";
         *ok = true;
         return QString::fromUtf8(proc.readAll());
     }
@@ -1527,9 +2231,7 @@ private:
         if (currentGame.isEmpty())
             return;
         bool ok = false;
-        QApplication::setOverrideCursor(Qt::WaitCursor); // the engine is waited for (up to 20 s)
         const QString out = runEngineInfo(tellSwitch, &ok);
-        QApplication::restoreOverrideCursor();
         showText(title + " - " + tellSwitch, out.trimmed().isEmpty() ? "(the engine printed nothing)" : out);
     }
 
