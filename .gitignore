@@ -1,0 +1,16 @@
+# Where `make` / `make cmake` (see Makefile) put their builds.
+/build/
+/build-cmake/
+
+# Left behind if qmake is ever run directly in this directory instead of in
+# build/ (the Makefile is written to avoid this, but better safe than sorry:
+# qmake's own generated Makefile would otherwise overwrite the tracked one).
+/agssetup
+/.qmake.stash
+/Makefile.Debug
+/Makefile.Release
+/*.o
+/moc_*.cpp
+/moc_*.h
+/*.moc
+/ui_*.h
