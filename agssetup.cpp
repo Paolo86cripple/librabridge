@@ -1472,6 +1472,8 @@ private:
                     const QString path = g.second;
                     connect(a, &QAction::triggered, this, [this, path]() { selectGame(path); });
                 }
+                recentMenu->addSeparator();
+                recentMenu->addAction("Clear recent games...", this, &AGSSetup::clearRecentGames);
             }
         });
         recentBtn->setMenu(recentMenu);
@@ -1843,6 +1845,49 @@ private:
             lastGameDir = QFileInfo(root).absoluteFilePath();
             selectGame(list->currentItem()->data(Qt::UserRole).toString());
         }
+    }
+
+    // Removes every OTHER configured game's saved settings (.cfg, .log,
+    // .preview.cfg) so the Recent menu starts empty again. The game currently
+    // open, if any, is left alone - clearing the list should not also erase
+    // what's on screen right now.
+    QStringList gamesToForget() const {
+        const QFileInfoList files = QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files);
+        QStringList toDelete;
+        for (const QFileInfo &fi : files) {
+            if (fi.fileName().endsWith(".preview.cfg"))
+                continue;
+            if (fi.absoluteFilePath() == cfgPath)
+                continue; // keep the game currently open
+            toDelete << fi.absoluteFilePath();
+        }
+        return toDelete;
+    }
+
+    void forgetGames(const QStringList &paths) {
+        for (const QString &path : paths) {
+            QFile::remove(path);
+            QString base = path;
+            base.chop(4); // strip ".cfg"
+            QFile::remove(base + ".log");
+            QFile::remove(base + ".preview.cfg");
+        }
+    }
+
+    void clearRecentGames() {
+        const QStringList toDelete = gamesToForget();
+        if (toDelete.isEmpty()) {
+            QMessageBox::information(this, "Recent games", "There is nothing to clear.");
+            return;
+        }
+        QString question = QString("Forget %1 configured game(s)? This deletes their saved "
+                                   "settings (graphics, shader, ...), not the games themselves.")
+                               .arg(toDelete.size());
+        if (!cfgPath.isEmpty())
+            question += "\n(The currently open game is kept.)";
+        if (QMessageBox::question(this, "Clear recent games", question) != QMessageBox::Yes)
+            return;
+        forgetGames(toDelete);
     }
 
     QString shaderStartDir() const {
