@@ -3,6 +3,7 @@ name: Build AGS + librashader (Linux x86_64)
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
     inputs:
       ags_ref:
@@ -29,17 +30,43 @@ env:
   LIBRASHADER_PINNED: 87e8a97b50516d997defeaa168173dcd185d4022    # 2026-07-04, v0.12.0
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        # Which variant(s) to build this run:
+        #   schedule (nightly)      -> canary only
+        #   a version tag (v*)      -> stable AND canary, so a release carries both
+        #   push to main / manual   -> stable only
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            matrix='["canary"]'
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            matrix='["stable","canary"]'
+          else
+            matrix='["stable"]'
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "building: $matrix"
+
   build:
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false # a broken canary must not cancel/hide a good stable build
+      matrix:
+        variant: ${{ fromJson(needs.setup.outputs.matrix) }}
     steps:
       - name: Pick the revisions to build
         env:
-          EVENT: ${{ github.event_name }}
+          VARIANT: ${{ matrix.variant }}
           INPUT_AGS: ${{ github.event.inputs.ags_ref }}
           INPUT_LIBRASHADER: ${{ github.event.inputs.librashader_ref }}
         run: |
-          if [ "$EVENT" = "schedule" ]; then
+          if [ "$VARIANT" = "canary" ]; then
             ags=master
             librashader=master
             artifact=ags-librashader-linux-x86_64-canary
@@ -152,12 +179,53 @@ jobs:
             echo "Build date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           } > "$pkg/BUILD_INFO.txt"
           # upload-artifact wraps its input in a zip, and a zip does not keep the executable
-          # bit: ship a tarball, which does.
-          tar -C pkg -czf ags-librashader-linux-x86_64.tar.gz ags-librashader
+          # bit: ship a tarball, which does. Named after the variant so a release that
+          # carries both stable and canary ends up with two distinct file names.
+          tar -C pkg -czf "$ARTIFACT_NAME.tar.gz" ags-librashader
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: ags-librashader-linux-x86_64.tar.gz
+          path: ${{ env.ARTIFACT_NAME }}.tar.gz
           if-no-files-found: error
+
+  release:
+    needs: build
+    # Runs for a version tag regardless of whether every matrix leg of build
+    # succeeded (always()): a broken canary must not block shipping a good
+    # stable build under the same tag. Whichever tarball(s) actually got
+    # uploaded are the ones published.
+    if: always() && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download whatever build(s) succeeded
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect tarballs
+        run: |
+          mkdir -p out
+          find dist -name '*.tar.gz' -exec cp {} out/ \;
+          ls -la out
+          [ -n "$(ls -A out)" ] || { echo "::error::No build succeeded for this tag - nothing to release"; exit 1; }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.tar.gz
+          body: |
+            Linux x86_64 builds of AGS with the librashader integration and the agssetup GUI.
+
+            - `ags-librashader-linux-x86_64.tar.gz` - stable: built from the pinned,
+              tested revisions of AGS and librashader (see this workflow's `AGS_PINNED` /
+              `LIBRASHADER_PINNED`, and each tarball's own `BUILD_INFO.txt`).
+            - `ags-librashader-linux-x86_64-canary.tar.gz` - canary: built from the current
+              tip of AGS and librashader `master`. Tracks upstream; may not work. Present
+              only if that build succeeded for this tag.
+
+            Extract with `tar xf <file>.tar.gz` (keeps the executable bit; a plain zip
+            download would not) and see the repository README for setup instructions.

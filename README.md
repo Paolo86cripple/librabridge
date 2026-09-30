@@ -189,6 +189,16 @@ AGS (rifacendo il patch se serve) e che la build e un gioco funzionino, poi
 cambia i due SHA nel workflow. Da *Actions → Run workflow* puoi anche compilare
 una revisione qualsiasi senza toccare il file (campi `ags_ref` e `librashader_ref`).
 
+## Release
+
+Un tag `v*` (es. `git tag v1.0.0 && git push origin v1.0.0`) fa compilare **sia**
+la build stabile **che** il canary nello stesso run, e pubblica una GitHub
+Release con entrambi i tarball allegati — scaricabili direttamente, senza dover
+essere loggati su GitHub come serve invece per gli artifact di Actions. Se il
+canary fallisce (il suo scopo è poter fallire quando qualcosa a monte cambia),
+la release parte comunque con la sola build stabile; fallisce solo se non è
+disponibile nessuna delle due.
+
 ## Usare la GUI (agssetup)
 
 La CI produce un artifact `ags-librashader-linux-x86_64`: uno zip che contiene
