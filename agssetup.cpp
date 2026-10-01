@@ -362,10 +362,59 @@ QVector<QPair<QString, QString>> recentGames(int maxCount) { // {display name, p
 // directly, mirroring what the patched engine does in
 // Engine/gfx/librashader_gl.cpp, but as its own, separate dlopen (agssetup and
 // the engine are different processes).
-#define LIBRA_RUNTIME_OPENGL
-#include "librashader-capi-headers/librashader_ld.h"
+#include <dlfcn.h>
 
 namespace {
+
+// Outcome of looking for librashader.so beside this executable, kept so the
+// preview can say WHY it is unavailable instead of one vague message.
+bool g_beside_exists = false;     // a librashader.so file is next to agssetup
+bool g_beside_loaded = false;     // ...and the dynamic loader accepted it
+QString g_beside_error;           // dlerror() text when it did not
+
+// The vendored loader (librashader_ld.h) asks for the bare name
+// "librashader.so", which the dynamic loader resolves only through
+// LD_LIBRARY_PATH (read once, at process start - changing it inside a running
+// process does nothing) or the system library paths. The library sits next to
+// this executable instead, so that is looked at first, by absolute path. The
+// vendored header stays untouched: its dlopen() is redirected here by the
+// macro below, only while the header is being included.
+void *PreviewDlopen(const char *name, int flags) {
+    const QString beside = QCoreApplication::applicationDirPath() + "/" + name;
+    if (QFileInfo::exists(beside)) {
+        g_beside_exists = true;
+        if (void *h = dlopen(beside.toUtf8().constData(), flags)) {
+            g_beside_loaded = true;
+            return h;
+        }
+        const char *err = dlerror();
+        g_beside_error = err ? QString::fromUtf8(err) : QString();
+    }
+    return dlopen(name, flags); // still honours LD_LIBRARY_PATH / system paths
+}
+
+} // namespace
+
+#define LIBRA_RUNTIME_OPENGL
+#define dlopen(name, flags) PreviewDlopen(name, flags)
+#include "librashader-capi-headers/librashader_ld.h"
+#undef dlopen
+
+namespace {
+
+// Why the preview has no librashader, in terms the user can act on.
+QString DescribeLibraryProblem() {
+    const QString dir = QCoreApplication::applicationDirPath();
+    if (!g_beside_exists)
+        return "librashader.so was not found next to agssetup (looked in " + dir +
+               ", then the system library paths).";
+    if (!g_beside_loaded)
+        return "Found " + dir + "/librashader.so but could not load it: " +
+               (g_beside_error.isEmpty() ? QString("unknown error") : g_beside_error);
+    return "Found and loaded " + dir + "/librashader.so, but it does not match this "
+           "build of agssetup (different librashader version). Use the librashader.so "
+           "that came in the same package as agssetup.";
+}
 
 // One instance for the whole agssetup process (loading it is not free, and
 // nothing about it depends on which preset or game is selected).
@@ -573,7 +622,7 @@ private:
         }
         const libra_instance_t &libra = PreviewLibra();
         if (!libra.instance_loaded) {
-            setStatus("librashader.so was not found next to agssetup.");
+            setStatus(DescribeLibraryProblem());
             return;
         }
 
