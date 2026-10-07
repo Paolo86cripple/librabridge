@@ -26,9 +26,11 @@ per le licenze di librashader e AGS.
     Non implementa NESSUNA logica di shader: carica `librashader.so` a
     runtime (dlopen, via l'header ufficiale `librashader_ld.h`) e chiama
     la sua API C per creare la filter chain da un preset e farla girare
-    frame per frame. Tutta la logica reale (parsing `.slangp`/`.glslp`,
+    frame per frame. Tutta la logica reale (parsing `.slangp`,
     pass multipli, feedback, history, LUT, parametri) è di librashader,
-    non nostra.
+    non nostra. librashader legge solo shader **slang**: i preset legacy
+    GLSL (`.glslp`, libretro/glsl-shaders) e Cg (`.cgp`) non funzionano (vedi
+    "Preset GLSL legacy" più sotto).
   - `Engine/gfx/librashader/` — header ufficiali di librashader (MIT),
     vendorizzati invariati, solo per compilare il bridge.
   - Modifiche chirurgiche a `Engine/gfx/ali3dogl.h`/`.cpp` (il renderer
@@ -102,8 +104,11 @@ Verificato in questo ambiente (container sandbox, niente GPU/display):
   (`Engine/main/config.cpp`) legge davvero, e le 29 chiavi che winsetup
   scrive sono tutte coperte. Il motore vero non è stato eseguito, quindi le
   voci del menu Diagnostics (`--tell-*`) non sono verificate con esso.
-  Stessa batteria ripetuta per Recent/Profile/Scan a folder/Diagnostics
-  annullabile: `recentGames()` trova il gioco appena salvato, un profilo
+  Stessa batteria ripetuta per libreria/Profile/Scan a folder/Diagnostics
+  annullabile: aprire un gioco lo mette subito in libreria (senza Save), la
+  lista è ordinata, filtrabile, distingue due giochi con lo stesso nome e
+  marca "(missing)" quello la cui cartella non c'è più, e un confronto con i
+  valori caricati rileva le modifiche non salvate; un profilo
   esportato non contiene il percorso del gioco e riapplicato ripristina
   esattamente i campi salvati, `looksLikeGame()` distingue correttamente
   cartelle valide da vuote/inesistenti, e annullare una diagnostica bloccata
@@ -171,6 +176,18 @@ AGS_LIBRASHADER_PRESET=/path/a/crt-royale.slangp ./ags /path/al/gioco
 ```
 oppure usa la GUI (sotto), che imposta tutto da sola.
 
+## Preset GLSL legacy (.glslp)
+
+librashader compila solo shader nel formato **slang** di RetroArch. Provato con
+un `.glslp` vero (`crt-easymode` da libretro/glsl-shaders): il preset si legge,
+ma la preparazione dello shader si ferma con `MissingVersionHeader`, perché gli
+shader GLSL legacy non hanno `#version` né `#pragma stage` e usano un'altra
+interfaccia (uniform e nomi dei pass diversi). Non è un difetto di questo
+progetto né qualcosa da attivare con un'opzione. La strada pratica è usare il
+`.slangp` corrispondente di libretro/slang-shaders, dove esistono le versioni
+degli shader più diffusi. La GUI offre solo `.slangp` nei selettori di file e, se
+scegli comunque un `.glslp`/`.cgp`, lo dice nella preview e prima di avviare.
+
 ## Revisioni fissate e canary notturno
 
 Le build su `push` e quelle lanciate a mano compilano revisioni **fissate** di
@@ -209,11 +226,21 @@ i permessi di esecuzione, lo zip no) e ottieni la cartella `ags-librashader/` co
 insieme nella stessa cartella.
 
 1. Avvia `./agssetup`.
-2. **Browse...** → *Game folder...*, *Game data file...* (`.ags`, `.exe`,
-   `ac2game.dat`) oppure *Scan a folder for games...* (utile per una libreria
-   con tanti giochi: cerca nella cartella scelta e un livello sotto, poi fai
-   scegliere quale aprire). **Recent...**, accanto a Browse, riapre in un
-   clic un gioco già configurato prima.
+2. Scegli il gioco dalla **libreria** a sinistra, oppure aggiungine uno con
+   **Add game...** (o con **Browse...** in alto): *Game folder...*, *Game data
+   file...* (`.ags`, `.exe`, `ac2game.dat`) oppure *Scan a folder for games...*
+   (utile per una raccolta con tanti giochi: cerca nella cartella scelta e un
+   livello sotto, poi fai scegliere quale aprire). Un gioco entra in libreria
+   la prima volta che lo apri, senza bisogno di premere Save.
+
+   La lista è ordinata per nome e filtrabile (campo **Filter...**); due giochi
+   con lo stesso nome si distinguono dalla cartella che li contiene, e uno la
+   cui cartella non c'è più (un disco non montato) resta in grigio con
+   "(missing)". Passando a un altro gioco con modifiche non salvate viene
+   chiesto se salvarle. **Remove** (o il menu del tasto destro) toglie il gioco
+   selezionato dalla libreria cancellando le sue impostazioni salvate qui — mai
+   i file del gioco — e *Remove all other games...* toglie tutti tranne quello
+   aperto.
 3. Regola le opzioni nelle schede, poi **Save && Play**.
 
 Le schede coprono tutto ciò che offre winsetup.exe e altro:
@@ -259,6 +286,9 @@ Sotto le schede:
   invece di un'attesa fissa.
 
 Le chiavi che la GUI non gestisce restano esattamente come erano.
+
+Le schede delle opzioni scorrono se la finestra è bassa (la scheda Shader contiene
+un'anteprima da 360 px), mentre Save e Save && Play restano sempre visibili.
 
 Una cosa che il motore fa e che sorprende: una dimensione come `x2` per la
 finestra (o `x3` per lo schermo intero) viene usata solo con lo scaling

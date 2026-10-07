@@ -45,6 +45,10 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QGroupBox>
+#include <QSplitter>
+#include <QScrollArea>
+#include <QHash>
+#include <algorithm>
 #include <QMenu>
 #include <QAction>
 #include <QDialog>
@@ -97,7 +101,9 @@ public:
 protected:
     void resizeEvent(QResizeEvent *event) override {
         QLabel::resizeEvent(event);
-        setMinimumHeight(heightForWidth(qMax(1, width())));
+        const int h = heightForWidth(qMax(1, width()));
+        if (h > 0) // an empty label reports -1; setMinimumHeight would warn
+            setMinimumHeight(h);
     }
 };
 } // namespace
@@ -108,8 +114,11 @@ namespace {
 const char *PREFS_LAST_GAME_PATH = "Preferences/LastGamePath";
 const char *PREFS_LAST_GAME_DIR = "Preferences/LastGameDirectory";
 const char *PREFS_LAST_SHADER_DIR = "Preferences/LastShaderDirectory";
-const char *PREFS_WINDOW_GEOMETRY = "Preferences/MainWindowGeometry";
+// V2: the window got a games-library panel and is wider; a geometry saved by the
+// single-pane layout (about 660 px) would squeeze it, so that one is ignored.
+const char *PREFS_WINDOW_GEOMETRY = "Preferences/MainWindowGeometryV2";
 const char *PREFS_CLOSE_ON_PLAY = "Preferences/CloseOnPlay";
+const char *PREFS_SPLITTER = "Preferences/SplitterState";
 
 // ---------------------------------------------------------------------------
 // Minimal INI model. QSettings is deliberately not used for the engine config:
@@ -325,12 +334,20 @@ QString sanitizeFileName(QString name) {
     return name.isEmpty() ? QString("profile") : name.left(60);
 }
 
-// Games configured before: the game_path recorded in every saved *.cfg under
-// configDir(), newest first. Used for a quick "Recent" picker instead of
-// retyping a path already set up once.
-QVector<QPair<QString, QString>> recentGames(int maxCount) { // {display name, path}
-    QVector<QPair<QString, QString>> out;
-    const QFileInfoList files = QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files, QDir::Time);
+// A game that has been set up before, as recorded by its saved settings file.
+struct GameEntry {
+    QString name;    // what the library shows
+    QString path;    // game folder or data file, as it was selected
+    QString cfgFile; // the settings file that records it (kept so a game whose
+                     // folder is gone, e.g. an unmounted drive, can still be removed)
+};
+
+// Every game with saved settings: the game_path recorded in each *.cfg under
+// configDir(), sorted by name. This list IS the games library - a game is in it
+// from the moment it is first opened here.
+QVector<GameEntry> configuredGames(int maxCount) {
+    QVector<GameEntry> out;
+    const QFileInfoList files = QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files);
     for (const QFileInfo &fi : files) {
         if (fi.fileName().endsWith(".preview.cfg"))
             continue;
@@ -344,10 +361,14 @@ QVector<QPair<QString, QString>> recentGames(int maxCount) { // {display name, p
         QString name = gi.isDir() ? gi.fileName() : gi.completeBaseName();
         if (name.isEmpty())
             name = path;
-        out.append({name, path});
+        out.append({name, path, fi.absoluteFilePath()});
         if (out.size() >= maxCount)
             break;
     }
+    std::sort(out.begin(), out.end(), [](const GameEntry &a, const GameEntry &b) {
+        const int c = a.name.compare(b.name, Qt::CaseInsensitive);
+        return c != 0 ? c < 0 : a.path < b.path;
+    });
     return out;
 }
 
@@ -401,6 +422,20 @@ void *PreviewDlopen(const char *name, int flags) {
 #undef dlopen
 
 namespace {
+
+// librashader compiles RetroArch's "slang" shaders only. Legacy GLSL (.glslp, as in
+// libretro/glsl-shaders) and Cg (.cgp) presets are rejected while their shaders are
+// preprocessed (no #version header / #pragma stage), so say so up front.
+bool IsLegacyPreset(const QString &path) {
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == "glslp" || suffix == "cgp";
+}
+
+const char *LegacyPresetHint() {
+    return "Legacy GLSL (.glslp) and Cg (.cgp) presets are not supported: librashader only "
+           "reads slang shaders. Use the .slangp version of the same shader from "
+           "libretro/slang-shaders.";
+}
 
 // Why the preview has no librashader, in terms the user can act on.
 QString DescribeLibraryProblem() {
@@ -620,6 +655,10 @@ private:
             setStatus("The preset file does not exist:\n" + currentPreset);
             return;
         }
+        if (IsLegacyPreset(currentPreset)) {
+            setStatus(LegacyPresetHint());
+            return;
+        }
         const libra_instance_t &libra = PreviewLibra();
         if (!libra.instance_loaded) {
             setStatus(DescribeLibraryProblem());
@@ -768,12 +807,15 @@ public:
     explicit AGSSetup(const QString &initialGame, QWidget *parent = nullptr)
         : QWidget(parent) {
         setWindowTitle("AGS Setup");
-        resize(660, 740);
+        resize(1060, 740); // wide enough for the 640 px preview; short enough for a 768 px screen
         loadPreferences();
         buildUI();
 
         if (!windowGeometry.isEmpty())
             restoreGeometry(windowGeometry);
+        if (!splitterState.isEmpty())
+            splitter->restoreState(splitterState);
+        refreshLibrary();
 
         const QString start = initialGame.isEmpty() ? lastGamePath : initialGame;
         if (!start.isEmpty()) {
@@ -808,6 +850,7 @@ private:
     QString lastShaderDir;
     QByteArray windowGeometry;
     bool closeOnPlay = true;
+    QByteArray splitterState;
 
     // Current game
     QString currentGame; // normalized path of the selected game; empty = none/invalid
@@ -823,6 +866,13 @@ private:
     QLabel *engineStatus = nullptr;
     QWidget *settingsPane = nullptr;
     QPushButton *saveBtn = nullptr;
+
+    // Games library (left panel)
+    QSplitter *splitter = nullptr;
+    QListWidget *libraryList = nullptr;
+    QLineEdit *libraryFilter = nullptr;
+    QPushButton *libraryRemoveBtn = nullptr;
+    bool updatingLibrary = false; // true while the list is rebuilt/synced from code
     QPushButton *playBtn = nullptr;
 
     // UI - options that other code needs to reach
@@ -899,6 +949,7 @@ private:
         lastShaderDir = prefs.value(PREFS_LAST_SHADER_DIR, "").toString();
         windowGeometry = prefs.value(PREFS_WINDOW_GEOMETRY).toByteArray();
         closeOnPlay = prefs.value(PREFS_CLOSE_ON_PLAY, true).toBool();
+        splitterState = prefs.value(PREFS_SPLITTER).toByteArray();
     }
 
     void savePreferences() {
@@ -910,6 +961,8 @@ private:
         if (!lastShaderDir.isEmpty())
             prefs.setValue(PREFS_LAST_SHADER_DIR, lastShaderDir);
         prefs.setValue(PREFS_WINDOW_GEOMETRY, saveGeometry());
+        if (splitter)
+            prefs.setValue(PREFS_SPLITTER, splitter->saveState());
         if (closeOnPlayBox)
             prefs.setValue(PREFS_CLOSE_ON_PLAY, closeOnPlayBox->isChecked());
     }
@@ -1207,8 +1260,9 @@ private:
         connect(dirBtn, &QPushButton::clicked, this, &AGSSetup::showShaderBrowser);
         sl->addWidget(dirBtn);
 
-        QLabel *note = new QLabel(
-            "Presets are RetroArch .slangp / .glslp files. Requires the engine build shipped with "
+        QLabel *note = new WrapLabel(
+            "Presets are RetroArch .slangp files (libretro/slang-shaders). Legacy GLSL .glslp and Cg "
+            ".cgp presets are not supported. Requires the engine build shipped with "
             "librabridge. The preset is ignored when the renderer is Software. If a preset cannot be "
             "built, the game starts without shaders and the reason is written to the engine log "
             "(Diagnostics > View last engine log).", this);
@@ -1487,8 +1541,32 @@ private:
         return page;
     }
 
+    // Option pages are tall (the Shader page holds a 360 px preview). Put in a scroll
+    // area they scroll when the window is short, instead of the layout squeezing
+    // widgets below their minimum size (the preview's status line used to land on top
+    // of the image) or demanding a window taller than a laptop screen. The Save/Play
+    // buttons are outside the tabs, so they stay visible.
+    QScrollArea *scrollable(QWidget *page) {
+        QScrollArea *area = new QScrollArea(this);
+        area->setWidgetResizable(true);
+        area->setFrameShape(QFrame::NoFrame);
+        area->setWidget(page);
+        return area;
+    }
+
     void buildUI() {
-        QVBoxLayout *root = new QVBoxLayout(this);
+        QHBoxLayout *outer = new QHBoxLayout(this);
+        splitter = new QSplitter(Qt::Horizontal, this);
+        splitter->addWidget(buildLibraryPanel());
+        QWidget *mainPane = new QWidget(splitter);
+        QVBoxLayout *root = new QVBoxLayout(mainPane);
+        root->setContentsMargins(0, 0, 0, 0);
+        splitter->addWidget(mainPane);
+        splitter->setStretchFactor(0, 0);
+        splitter->setStretchFactor(1, 1);
+        splitter->setCollapsible(1, false);
+        splitter->setSizes({230, 830});
+        outer->addWidget(splitter);
 
         // Game data (existing files, referenced in place)
         QGroupBox *gameBox = new QGroupBox("Game", this);
@@ -1508,36 +1586,16 @@ private:
         browseGameBtn->setMenu(browseMenu);
         connect(gamePath, &QLineEdit::editingFinished, this, &AGSSetup::onGamePathEdited);
 
-        QPushButton *recentBtn = new QPushButton("Recent...", this);
-        QMenu *recentMenu = new QMenu(recentBtn);
-        connect(recentMenu, &QMenu::aboutToShow, this, [this, recentMenu]() {
-            recentMenu->clear();
-            const auto games = recentGames(15);
-            if (games.isEmpty()) {
-                recentMenu->addAction("(no configured games yet)")->setEnabled(false);
-            } else {
-                for (const auto &g : games) {
-                    QAction *a = recentMenu->addAction(g.first + "   " + g.second);
-                    const QString path = g.second;
-                    connect(a, &QAction::triggered, this, [this, path]() { selectGame(path); });
-                }
-                recentMenu->addSeparator();
-                recentMenu->addAction("Clear recent games...", this, &AGSSetup::clearRecentGames);
-            }
-        });
-        recentBtn->setMenu(recentMenu);
-
         gameRow->addWidget(gamePath, 1);
         gameRow->addWidget(browseGameBtn);
-        gameRow->addWidget(recentBtn);
         gameLayout->addLayout(gameRow);
 
-        gameStatus = new QLabel(this);
+        gameStatus = new WrapLabel(this);
         gameStatus->setWordWrap(true);
         gameStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
         gameLayout->addWidget(gameStatus);
 
-        engineStatus = new QLabel(this);
+        engineStatus = new WrapLabel(this);
         engineStatus->setWordWrap(true);
         engineStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
         gameLayout->addWidget(engineStatus);
@@ -1551,13 +1609,13 @@ private:
         paneLayout->setContentsMargins(0, 0, 0, 0);
 
         QTabWidget *tabs = new QTabWidget(settingsPane);
-        tabs->addTab(buildGraphicsTab(), "Graphics");
-        tabs->addTab(buildShaderTab(), "Shader");
-        tabs->addTab(buildAudioTab(), "Audio");
-        tabs->addTab(buildControlsTab(), "Controls");
-        tabs->addTab(buildGameTab(), "Game");
-        tabs->addTab(buildAccessTab(), "Accessibility");
-        tabs->addTab(buildAdvancedTab(), "Advanced");
+        tabs->addTab(scrollable(buildGraphicsTab()), "Graphics");
+        tabs->addTab(scrollable(buildShaderTab()), "Shader");
+        tabs->addTab(scrollable(buildAudioTab()), "Audio");
+        tabs->addTab(scrollable(buildControlsTab()), "Controls");
+        tabs->addTab(scrollable(buildGameTab()), "Game");
+        tabs->addTab(scrollable(buildAccessTab()), "Accessibility");
+        tabs->addTab(scrollable(buildAdvancedTab()), "Advanced");
         paneLayout->addWidget(tabs, 1);
 
         QHBoxLayout *toolRow = new QHBoxLayout();
@@ -1717,6 +1775,7 @@ private:
         ini = IniFile();
         gameStatus->setText(message);
         updateEnabledState();
+        syncLibrarySelection();
     }
 
     bool selectGame(const QString &rawPath) {
@@ -1733,9 +1792,223 @@ private:
         logPath = QDir(configDir()).filePath(key + ".log");
         previewPath = QDir(configDir()).filePath(key + ".preview.cfg");
         seedPath = QDir(gameDirOf(currentGame)).filePath("acsetup.cfg");
+        const bool isNew = !QFileInfo::exists(cfgPath);
         loadGameConfig();
+        // Opening a game for the first time adds it to the library: its settings
+        // file (a copy of the game's own acsetup.cfg, or empty defaults, plus the
+        // game's path) is created now rather than at the first Save.
+        const bool joined = isNew || !ini.contains("librabridge", "game_path");
+        if (joined)
+            registerCurrentGame();
         updateEnabledState();
+        if (joined)
+            refreshLibrary();
+        else
+            syncLibrarySelection();
         return true;
+    }
+
+    // ----- games library (left panel) -----
+
+    QWidget *buildLibraryPanel() {
+        QWidget *panel = new QWidget(this);
+        panel->setMinimumWidth(170);
+        QVBoxLayout *l = new QVBoxLayout(panel);
+        l->setContentsMargins(0, 0, 0, 0);
+
+        QLabel *title = new QLabel("Games", panel);
+        QFont bold = title->font();
+        bold.setBold(true);
+        title->setFont(bold);
+        l->addWidget(title);
+
+        libraryFilter = new QLineEdit(panel);
+        libraryFilter->setPlaceholderText("Filter...");
+        libraryFilter->setClearButtonEnabled(true);
+        connect(libraryFilter, &QLineEdit::textChanged, this, &AGSSetup::applyLibraryFilter);
+        l->addWidget(libraryFilter);
+
+        libraryList = new QListWidget(panel);
+        libraryList->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(libraryList, &QListWidget::itemClicked, this, &AGSSetup::onLibraryItemChosen);
+        connect(libraryList, &QListWidget::itemActivated, this, &AGSSetup::onLibraryItemChosen);
+        connect(libraryList, &QListWidget::currentItemChanged, this, [this]() { updateLibraryButtons(); });
+        connect(libraryList, &QWidget::customContextMenuRequested, this, &AGSSetup::showLibraryMenu);
+        l->addWidget(libraryList, 1);
+
+        QHBoxLayout *row = new QHBoxLayout();
+        QPushButton *addBtn = new QPushButton("Add game...", panel);
+        QMenu *addMenu = new QMenu(addBtn);
+        connect(addMenu->addAction("Game data file (.ags, .exe, ac2game.dat)..."), &QAction::triggered,
+                this, &AGSSetup::browseGameFile);
+        connect(addMenu->addAction("Game folder..."), &QAction::triggered, this, &AGSSetup::browseGameFolder);
+        connect(addMenu->addAction("Scan a folder for games..."), &QAction::triggered,
+                this, &AGSSetup::scanFolderForGames);
+        addBtn->setMenu(addMenu);
+        libraryRemoveBtn = new QPushButton("Remove", panel);
+        libraryRemoveBtn->setToolTip("Remove the selected game from the library. This deletes its saved settings\n"
+                                     "here; the game's own files are not touched.");
+        connect(libraryRemoveBtn, &QPushButton::clicked, this, [this]() {
+            if (QListWidgetItem *item = libraryList->currentItem())
+                removeLibraryGame(item);
+        });
+        row->addWidget(addBtn, 1);
+        row->addWidget(libraryRemoveBtn);
+        l->addLayout(row);
+        updateLibraryButtons();
+        return panel;
+    }
+
+    void updateLibraryButtons() {
+        if (libraryRemoveBtn && libraryList)
+            libraryRemoveBtn->setEnabled(libraryList->currentItem() != nullptr);
+    }
+
+    void refreshLibrary() {
+        if (!libraryList)
+            return;
+        updatingLibrary = true;
+        libraryList->clear();
+        const QVector<GameEntry> games = configuredGames(500);
+        QHash<QString, int> sameName;
+        for (const GameEntry &g : games)
+            sameName[g.name.toLower()]++;
+        for (const GameEntry &g : games) {
+            const QFileInfo gi(g.path);
+            QString label = g.name;
+            if (sameName.value(g.name.toLower()) > 1) {
+                // two games with the same name: tell them apart by where they live
+                const QDir holder = gi.isDir() ? gi.dir() : QFileInfo(gi.absolutePath()).dir();
+                label += "  (" + holder.dirName() + ")";
+            }
+            const bool missing = !gi.exists();
+            if (missing)
+                label += "  (missing)";
+            QListWidgetItem *item = new QListWidgetItem(label, libraryList);
+            item->setData(Qt::UserRole, g.path);
+            item->setData(Qt::UserRole + 1, g.cfgFile);
+            item->setToolTip(missing ? g.path + "\nNot found - is its drive mounted?" : g.path);
+            if (missing)
+                item->setForeground(palette().color(QPalette::Disabled, QPalette::Text));
+        }
+        updatingLibrary = false;
+        applyLibraryFilter();
+        syncLibrarySelection();
+    }
+
+    void applyLibraryFilter() {
+        if (!libraryList)
+            return;
+        const QString needle = libraryFilter ? libraryFilter->text().trimmed() : QString();
+        for (int i = 0; i < libraryList->count(); ++i) {
+            QListWidgetItem *item = libraryList->item(i);
+            const bool match = needle.isEmpty() ||
+                item->text().contains(needle, Qt::CaseInsensitive) ||
+                item->data(Qt::UserRole).toString().contains(needle, Qt::CaseInsensitive);
+            item->setHidden(!match);
+        }
+    }
+
+    // Highlights the open game in the list (or nothing, if there is none or it
+    // is not in the library) without that counting as the user picking it.
+    void syncLibrarySelection() {
+        if (!libraryList)
+            return;
+        const bool before = updatingLibrary;
+        updatingLibrary = true;
+        QListWidgetItem *match = nullptr;
+        if (!currentGame.isEmpty()) {
+            for (int i = 0; i < libraryList->count() && !match; ++i)
+                if (libraryList->item(i)->data(Qt::UserRole).toString() == currentGame)
+                    match = libraryList->item(i);
+        }
+        if (match) {
+            libraryList->setCurrentItem(match);
+        } else {
+            libraryList->clearSelection();
+            libraryList->setCurrentItem(nullptr);
+        }
+        updatingLibrary = before;
+        updateLibraryButtons();
+    }
+
+    void registerCurrentGame() {
+        if (cfgPath.isEmpty() || !QDir().mkpath(configDir()))
+            return;
+        ini.setValue("librabridge", "game_path", currentGame);
+        ini.save(cfgPath); // the seed as loaded, plus the game path - nothing else added
+    }
+
+    // True when any option differs from what was loaded into the widgets.
+    bool isDirty() const {
+        if (currentGame.isEmpty() || loadedValues.size() != bindings.size())
+            return false;
+        for (int i = 0; i < bindings.size(); ++i)
+            if (bindings[i].save() != loadedValues[i])
+                return true;
+        return false;
+    }
+
+    // Before leaving the open game for another: offer to keep unsaved changes.
+    bool confirmLeaveCurrentGame() {
+        if (!isDirty())
+            return true;
+        QMessageBox box(QMessageBox::Question, "Unsaved changes",
+                        "This game has unsaved changes.", QMessageBox::Save | QMessageBox::Discard |
+                        QMessageBox::Cancel, this);
+        box.setInformativeText("Save them before switching to another game?");
+        const int answer = box.exec();
+        if (answer == QMessageBox::Save)
+            return save();
+        return answer == QMessageBox::Discard;
+    }
+
+    void onLibraryItemChosen(QListWidgetItem *item) {
+        if (updatingLibrary || !item)
+            return;
+        const QString path = item->data(Qt::UserRole).toString();
+        if (path == currentGame)
+            return;
+        // Deferred: switching games rebuilds the list's state, and this click is
+        // still being handled by the list.
+        QTimer::singleShot(0, this, [this, path]() { switchToGame(path); });
+    }
+
+    void switchToGame(const QString &path) {
+        if (!confirmLeaveCurrentGame()) {
+            syncLibrarySelection(); // stay on the current game, highlight it again
+            return;
+        }
+        selectGame(path);
+    }
+
+    void removeLibraryGame(QListWidgetItem *item) {
+        const QString path = item->data(Qt::UserRole).toString();
+        const QString cfgFile = item->data(Qt::UserRole + 1).toString();
+        if (QMessageBox::question(this, "Remove game",
+                "Remove \"" + item->text().trimmed() + "\" from the library?\n"
+                "Its saved settings are deleted here; the game's own files are not touched.") != QMessageBox::Yes)
+            return;
+        forgetGames({cfgFile});
+        if (path == currentGame) {
+            gamePath->clear();
+            clearGame("Removed from the library.");
+        }
+        refreshLibrary();
+    }
+
+    void showLibraryMenu(const QPoint &pos) {
+        QListWidgetItem *item = libraryList->itemAt(pos);
+        QMenu menu(this);
+        QAction *removeThis = item ? menu.addAction("Remove from library...") : nullptr;
+        QAction *removeOthers = menu.addAction("Remove all other games...");
+        QAction *chosen = menu.exec(libraryList->viewport()->mapToGlobal(pos));
+        if (!chosen)
+            return;
+        if (chosen == removeThis)
+            removeLibraryGame(item);
+        else if (chosen == removeOthers)
+            removeAllOtherGames();
     }
 
     // Translations are the .tra files that sit in the game's folder.
@@ -1897,7 +2170,7 @@ private:
     }
 
     // Removes every OTHER configured game's saved settings (.cfg, .log,
-    // .preview.cfg) so the Recent menu starts empty again. The game currently
+    // .preview.cfg) so the library holds only that one. The game currently
     // open, if any, is left alone - clearing the list should not also erase
     // what's on screen right now.
     QStringList gamesToForget() const {
@@ -1923,20 +2196,21 @@ private:
         }
     }
 
-    void clearRecentGames() {
+    void removeAllOtherGames() {
         const QStringList toDelete = gamesToForget();
         if (toDelete.isEmpty()) {
-            QMessageBox::information(this, "Recent games", "There is nothing to clear.");
+            QMessageBox::information(this, "Games library", "There are no other games to remove.");
             return;
         }
-        QString question = QString("Forget %1 configured game(s)? This deletes their saved "
+        QString question = QString("Remove %1 other game(s) from the library? This deletes their saved "
                                    "settings (graphics, shader, ...), not the games themselves.")
                                .arg(toDelete.size());
         if (!cfgPath.isEmpty())
             question += "\n(The currently open game is kept.)";
-        if (QMessageBox::question(this, "Clear recent games", question) != QMessageBox::Yes)
+        if (QMessageBox::question(this, "Remove all other games", question) != QMessageBox::Yes)
             return;
         forgetGames(toDelete);
+        refreshLibrary();
     }
 
     QString shaderStartDir() const {
@@ -1948,7 +2222,7 @@ private:
     void browseShader() {
         const QString path = QFileDialog::getOpenFileName(
             this, "Choose a RetroArch shader preset", shaderStartDir(),
-            "Shader presets (*.slangp *.glslp);;All files (*)");
+            "Shader presets (*.slangp);;All files (*)");
         if (!path.isEmpty()) {
             shaderPath->setText(path);
             lastShaderDir = QFileInfo(path).path();
@@ -1963,7 +2237,7 @@ private:
             return;
         const QString path = QFileDialog::getOpenFileName(
             this, "Choose a shader preset", dir,
-            "Shader presets (*.slangp *.glslp);;All files (*)");
+            "Shader presets (*.slangp);;All files (*)");
         if (!path.isEmpty()) {
             shaderPath->setText(path);
             lastShaderDir = QFileInfo(path).path();
@@ -2167,6 +2441,10 @@ private:
 
         const bool useShader = shaderWanted();
         const QString preset = shaderPath->text().trimmed();
+        if (useShader && IsLegacyPreset(preset) &&
+            QMessageBox::question(this, "Unsupported shader preset",
+                QString(LegacyPresetHint()) + "\n\nStart the game anyway, without a shader?") != QMessageBox::Yes)
+            return false;
         if (useShader && !QFileInfo::exists(preset)) {
             QMessageBox::warning(this, "Shader preset not found",
                                  "The shader preset does not exist:\n" + preset);
