@@ -873,6 +873,7 @@ private:
     QLineEdit *libraryFilter = nullptr;
     QPushButton *libraryRemoveBtn = nullptr;
     bool updatingLibrary = false; // true while the list is rebuilt/synced from code
+    QString libraryFocus;         // entry the user picked that could not be opened (e.g. missing files)
     QPushButton *playBtn = nullptr;
 
     // UI - options that other code needs to reach
@@ -1756,6 +1757,11 @@ private:
 
     void onGamePathEdited() {
         const QString text = gamePath->text().trimmed();
+        // Focus loss on the (unchanged) path of a library entry that failed to open
+        // must not drop its selection - the user may be heading for Remove.
+        if (currentGame.isEmpty() && !libraryFocus.isEmpty() && normalizeUserPath(text) == libraryFocus)
+            return;
+        libraryFocus.clear();
         if (text.isEmpty()) {
             clearGame("");
             return;
@@ -1785,6 +1791,7 @@ private:
             clearGame(why);
             return false;
         }
+        libraryFocus.clear();
         currentGame = path;
         gamePath->setText(path);
         const QString key = gameKey(path);
@@ -1917,9 +1924,12 @@ private:
         const bool before = updatingLibrary;
         updatingLibrary = true;
         QListWidgetItem *match = nullptr;
-        if (!currentGame.isEmpty()) {
+        // With no game open, keep highlighting an entry the user picked but that
+        // could not be opened: it must stay selectable so it can be removed.
+        const QString target = currentGame.isEmpty() ? libraryFocus : currentGame;
+        if (!target.isEmpty()) {
             for (int i = 0; i < libraryList->count() && !match; ++i)
-                if (libraryList->item(i)->data(Qt::UserRole).toString() == currentGame)
+                if (libraryList->item(i)->data(Qt::UserRole).toString() == target)
                     match = libraryList->item(i);
         }
         if (match) {
@@ -1979,7 +1989,11 @@ private:
             syncLibrarySelection(); // stay on the current game, highlight it again
             return;
         }
-        selectGame(path);
+        libraryFocus = path;
+        if (!selectGame(path)) {
+            gamePath->setText(path); // shows what failed; status line says why
+            syncLibrarySelection();
+        }
     }
 
     void removeLibraryGame(QListWidgetItem *item) {
@@ -1990,6 +2004,8 @@ private:
                 "Its saved settings are deleted here; the game's own files are not touched.") != QMessageBox::Yes)
             return;
         forgetGames({cfgFile});
+        if (path == libraryFocus)
+            libraryFocus.clear();
         if (path == currentGame) {
             gamePath->clear();
             clearGame("Removed from the library.");
