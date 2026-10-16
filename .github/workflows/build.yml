@@ -239,3 +239,7 @@ jobs:
 
             Extract with `tar xf <file>.tar.gz` (keeps the executable bit; a plain zip
             download would not) and see the repository README for setup instructions.
+
+            `agssetup` needs Qt 6 on the system (Widgets, OpenGLWidgets and Network modules;
+            e.g. `qt6-base` on Arch, `libqt6widgets6 libqt6openglwidgets6 libqt6network6` on
+            Debian/Ubuntu). Keep `ags`, `librashader.so` and `agssetup` in the same folder.

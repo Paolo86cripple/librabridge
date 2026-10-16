@@ -16,7 +16,12 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
-work=${TEST_BUILD_DIR:-$(mktemp -d)}
+if [ -n "${TEST_BUILD_DIR:-}" ]; then
+    work=$TEST_BUILD_DIR
+else
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+fi
 mkdir -p "$work"
 cd "$work"
 
@@ -55,4 +60,4 @@ if [ -z "${QT_QPA_PLATFORM:-}" ] && [ -z "${DISPLAY:-}" ]; then
     export QT_QPA_PLATFORM=offscreen
 fi
 echo "platform: ${QT_QPA_PLATFORM:-default (DISPLAY=${DISPLAY:-})}"
-exec ./gui_test
+./gui_test

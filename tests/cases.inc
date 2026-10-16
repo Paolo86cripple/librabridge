@@ -236,12 +236,54 @@ void testLocate(AGSSetup &w, const QString &work) {
     check(over.value("zz", "marker") == "from-A", "B now has A's settings");
 }
 
+void testLocateOpenGameWithEdits(AGSSetup &w, const QString &work) {
+    std::puts("== locate: the open game has unsaved edits");
+    Clicker clicker;
+    const QString oldPath = makeGame(work + "/dirty/Edited");
+    w.selectGame(oldPath);
+    const QString oldCfg = w.cfgPath;
+    w.shaderParams = "X=1";
+    check(w.isDirty(), "the game has unsaved edits");
+    QDir().mkpath(work + "/dirty-new");
+    QDir().rename(oldPath, work + "/dirty-new/Edited");
+    const QString newPath = QFileInfo(work + "/dirty-new/Edited").absoluteFilePath();
+    w.refreshLibrary();
+
+    clicker.answers["Unsaved changes"] = QMessageBox::Cancel;
+    w.relocateTo(itemFor(w, oldPath), newPath);
+    check(QFileInfo::exists(oldCfg) && w.currentGame == oldPath, "Cancel leaves everything as it was");
+
+    clicker.answers["Unsaved changes"] = QMessageBox::Save;
+    w.relocateTo(itemFor(w, oldPath), newPath);
+    check(!QFileInfo::exists(oldCfg), "after Save the old settings file does not come back");
+    check(w.currentGame == newPath && w.shaderParams == "X=1" && !w.isDirty(), "the saved edit moved with the game");
+    int entries = 0;
+    for (int i = 0; i < w.libraryList->count(); ++i) {
+        const QString path = w.libraryList->item(i)->data(Qt::UserRole).toString();
+        entries += (path == oldPath || path == newPath);
+    }
+    check(entries == 1 && !itemFor(w, oldPath), "one library entry, no ghost at the old path");
+}
+
+void testLibraryCap(const QString &work) {
+    std::puts("== library: the cap keeps the first games by name");
+    for (const char *n : {"Capalpha", "Capbravo", "Capcharlie"})
+        writeFile(QDir(configDir()).filePath(QString("cap-%1.cfg").arg(n)),
+                  (QString("[librabridge]\ngame_path=%1/cap/%2\n").arg(work, n)).toUtf8());
+    const QVector<GameEntry> all = configuredGames(1000);
+    const QVector<GameEntry> cut = configuredGames(all.size() - 1);
+    check(cut.size() == all.size() - 1 && all.size() > 3, "one is cut off");
+    check(!cut.isEmpty() && cut.last().path == all[all.size() - 2].path,
+          "what is cut is the last by name, not an arbitrary one");
+}
+
 void testParams(AGSSetup &w, const QString &work) {
     std::puts("== shader parameters: storage and hand-over to the engine");
     check(FormatParams(ParseParams("A=1;B=0.5")) == "A=1;B=0.5", "format/parse round trip");
     check(ParseParams(" A = 2 ; ;=3;B;C=x;D=1;E;").size() == 2, "junk entries are dropped, tidy ones kept");
     check(ParseParams("A=1.5").value("A") == 1.5, "decimal point");
     check(FormatParams(ParseParams("A=2.4000000954")) == "A=2.4000001", "9 significant digits");
+    check(ParseParams("A=nan;B=inf;C=-inf;D=1").size() == 1, "non-finite values are dropped");
 
     const QString game = makeGame(work + "/params/Game");
     check(w.selectGame(game), "game opens");
@@ -340,6 +382,23 @@ void testPreview(const QString &work, bool haveLibra) {
     QTest::qWait(300);
     p.grabFramebuffer();
     check(p.statusText().contains("Could not read the image"), "an unreadable picture says so");
+    // the same name, now holding a real picture: Refresh must pick it up
+    flat.save(work + "/not-an-image.png");
+    p.refresh(QString());
+    QTest::qWait(300);
+    shot = p.grabFramebuffer();
+    check(!p.statusText().contains("Could not read") && near(sample(shot, 320, 180), 120, 80, 40),
+          "a picture fixed under the same name is re-read on refresh");
+
+    // transparency in a picture must not show through to the window behind
+    QImage clear(64, 48, QImage::Format_ARGB32);
+    clear.fill(QColor(255, 0, 0, 0));
+    clear.save(work + "/clear.png");
+    p.setSourceImage(work + "/clear.png");
+    p.refresh(QString());
+    QTest::qWait(300);
+    shot = p.grabFramebuffer();
+    check(sample(shot, 320, 180).alpha() == 255, "a transparent picture is shown opaque");
 
     if (!haveLibra) {
         skip("no librashader.so: the filter chain part of the preview");
@@ -452,6 +511,8 @@ int main(int argc, char **argv) {
     w.show();
     testLibraryRemoveMissing(w, work);
     testLocate(w, work);
+    testLocateOpenGameWithEdits(w, work);
+    testLibraryCap(work);
     testParams(w, work);
     testListParams(work, haveLibra);
     testDownload(w, work);

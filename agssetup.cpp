@@ -373,13 +373,13 @@ QVector<GameEntry> configuredGames(int maxCount) {
         if (name.isEmpty())
             name = path;
         out.append({name, path, fi.absoluteFilePath()});
-        if (out.size() >= maxCount)
-            break;
     }
     std::sort(out.begin(), out.end(), [](const GameEntry &a, const GameEntry &b) {
         const int c = a.name.compare(b.name, Qt::CaseInsensitive);
         return c != 0 ? c < 0 : a.path < b.path;
     });
+    if (out.size() > maxCount)
+        out.resize(maxCount); // the first ones by name, not whichever the disk listed first
     return out;
 }
 
@@ -514,7 +514,7 @@ ParamMap ParseParams(const QString &spec) {
         const QString name = item.left(eq).trimmed();
         bool ok = false;
         const double v = item.mid(eq + 1).trimmed().toDouble(&ok);
-        if (ok && ValidParamName(name))
+        if (ok && std::isfinite(v) && ValidParamName(name))
             out.insert(name, v);
     }
     return out;
@@ -604,6 +604,8 @@ public:
     void refresh(const QString &presetPath) {
         pendingPreset = presetPath;
         rebuildPending = true;
+        if (!requestedImage.isEmpty())
+            imagePending = true; // the file may have changed (or been fixed) under the same name
         update();
         if (!glReady)
             emit statusChanged(); // paintGL() won't run to report this itself
@@ -807,7 +809,7 @@ private:
             } else {
                 if (img.width() > 4096 || img.height() > 4096)
                     img = img.scaled(4096, 4096, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-                img = img.convertToFormat(QImage::Format_RGBA8888).mirrored(false, true); // GL rows run bottom-up
+                img = img.convertToFormat(QImage::Format_RGBX8888).mirrored(false, true); // opaque; GL rows run bottom-up
                 glGenTextures(1, &imageTex);
                 glBindTexture(GL_TEXTURE_2D, imageTex);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2310,6 +2312,11 @@ private:
         if (newPath == oldPath)
             return;
 
+        // Unsaved edits of the game being moved are settled FIRST: a later "Save"
+        // would write them to the old settings file and bring the old entry back.
+        const bool wasOpen = !currentGame.isEmpty() && oldPath == currentGame;
+        if (wasOpen && !confirmLeaveCurrentGame())
+            return;
         const QString key = gameKey(newPath);
         const QString newCfg = QDir(configDir()).filePath(key + ".cfg");
         if (newCfg != oldCfg && QFileInfo::exists(newCfg) &&
@@ -2340,7 +2347,12 @@ private:
         }
         libraryFocus.clear();
         refreshLibrary();
-        switchToGame(newPath); // open it right away (asks first if the open game has unsaved changes)
+        // Open it right away. The moved game itself was settled above; another open
+        // game with unsaved changes is asked about by switchToGame.
+        if (wasOpen)
+            selectGame(newPath);
+        else
+            switchToGame(newPath);
     }
 
     void showLibraryMenu(const QPoint &pos) {
