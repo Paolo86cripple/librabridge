@@ -383,6 +383,71 @@ QVector<GameEntry> configuredGames(int maxCount) {
     return out;
 }
 
+// What a folder scan found. A scan looks in the folder itself and up to two
+// levels below it (a common layout for game libraries:
+// Library/GameName/GameName/data), and is bounded two ways so that pointing it at a
+// whole media drive cannot run for ever: by results and by folders visited.
+struct ScanResult {
+    QVector<QPair<QString, QString>> found; // {display name, path}
+    bool stopped = false;                   // `tick` asked it to stop (the user cancelled)
+    bool capped = false;                    // a bound was reached: the list is partial
+    int visited = 0;
+};
+
+// `tick` is called with each folder about to be examined and returns false to stop.
+ScanResult ScanForGames(const QString &root, int maxResults, int maxDirs,
+                        const std::function<bool(const QString &)> &tick) {
+    ScanResult r;
+    auto examine = [&](const QString &dir) -> bool { // false = stop scanning
+        if (r.visited >= maxDirs) {
+            r.capped = true;
+            return false;
+        }
+        ++r.visited;
+        if (tick && !tick(dir)) {
+            r.stopped = true;
+            return false;
+        }
+        return true;
+    };
+    auto full = [&]() {
+        if (r.found.size() >= maxResults) {
+            r.capped = true;
+            return true;
+        }
+        return false;
+    };
+
+    QString why;
+    if (!examine(root))
+        return r;
+    if (looksLikeGame(root, &why))
+        r.found.append({QFileInfo(root).fileName(), root});
+    const QFileInfoList level1 = QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo &d1 : level1) {
+        if (full() || !examine(d1.absoluteFilePath()))
+            break;
+        if (looksLikeGame(d1.absoluteFilePath(), &why)) {
+            r.found.append({d1.fileName(), d1.absoluteFilePath()});
+            continue; // don't also descend into a folder that is itself a game
+        }
+        const QFileInfoList level2 = QDir(d1.absoluteFilePath()).entryInfoList(
+            QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+        bool stop = false;
+        for (const QFileInfo &d2 : level2) {
+            if (full() || !examine(d2.absoluteFilePath())) {
+                stop = true;
+                break;
+            }
+            if (looksLikeGame(d2.absoluteFilePath(), &why))
+                r.found.append({d1.fileName(), d2.absoluteFilePath()});
+        }
+        if (stop)
+            break;
+    }
+    return r;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2152,20 +2217,50 @@ private:
                 const QDir holder = gi.isDir() ? gi.dir() : QFileInfo(gi.absolutePath()).dir();
                 label += "  (" + holder.dirName() + ")";
             }
-            const bool missing = !gi.exists();
-            if (missing)
-                label += "  (missing)";
             QListWidgetItem *item = new QListWidgetItem(label, libraryList);
             item->setData(Qt::UserRole, g.path);
             item->setData(Qt::UserRole + 1, g.cfgFile);
-            item->setToolTip(missing ? g.path + "\nNot found - is its drive mounted?" : g.path);
-            if (missing)
-                item->setForeground(palette().color(QPalette::Disabled, QPalette::Text));
+            item->setData(Qt::UserRole + 2, label); // without the "(missing)" mark
+            markMissing(item, !gi.exists());
         }
         updatingLibrary = false;
         applyLibraryFilter();
         syncLibrarySelection();
     }
+
+    // Shows (or clears) the "(missing)" state of an entry.
+    void markMissing(QListWidgetItem *item, bool missing) {
+        const QString base = item->data(Qt::UserRole + 2).toString();
+        const QString path = item->data(Qt::UserRole).toString();
+        item->setText(missing ? base + "  (missing)" : base);
+        item->setToolTip(missing ? path + "\nNot found - is its drive mounted?" : path);
+        item->setForeground(missing ? QBrush(palette().color(QPalette::Disabled, QPalette::Text)) : QBrush());
+    }
+
+    // A drive mounted (or a folder moved back) while this window was in the
+    // background: bring the marks up to date without rebuilding the list, so the
+    // selection and the filter stay as they are.
+    void refreshMissingMarks() {
+        if (!libraryList || updatingLibrary)
+            return;
+        for (int i = 0; i < libraryList->count(); ++i) {
+            QListWidgetItem *item = libraryList->item(i);
+            const bool missing = !QFileInfo::exists(item->data(Qt::UserRole).toString());
+            if (missing != item->text().endsWith("(missing)"))
+                markMissing(item, missing);
+        }
+        applyLibraryFilter();
+        updateLibraryButtons();
+    }
+
+protected:
+    bool event(QEvent *e) override {
+        if (e->type() == QEvent::WindowActivate)
+            refreshMissingMarks();
+        return QWidget::event(e);
+    }
+
+private:
 
     void applyLibraryFilter() {
         if (!libraryList)
@@ -2468,68 +2563,130 @@ private:
         selectGame(d);
     }
 
-    // Looks for game data directly under a folder and, one level further down
-    // (a common layout for game libraries: Library/GameName/GameName/data),
-    // then lets the user pick one. Bounded to keep a scan of a big media
-    // drive from taking forever.
+    // True when this game already has settings here, i.e. is in the library.
+    static bool inLibrary(const QString &gamePathText) {
+        return QFileInfo::exists(QDir(configDir()).filePath(gameKey(normalizeUserPath(gamePathText)) + ".cfg"));
+    }
+
+    // Puts a game in the library without opening it: its settings start as a copy
+    // of the game's own acsetup.cfg (read-only, like when it is opened), plus its
+    // path. Returns false if it is not a game, is already there, or cannot be written.
+    bool addGameToLibrary(const QString &rawPath) {
+        const QString path = normalizeUserPath(rawPath);
+        QString why;
+        if (path.isEmpty() || !looksLikeGame(path, &why) || inLibrary(path))
+            return false;
+        if (!QDir().mkpath(configDir()))
+            return false;
+        IniFile seed;
+        seed.load(QDir(gameDirOf(path)).filePath("acsetup.cfg")); // no seed is fine: defaults
+        seed.setValue("librabridge", "game_path", path);
+        return seed.save(QDir(configDir()).filePath(gameKey(path) + ".cfg"));
+    }
+
     void scanFolderForGames() {
         const QString root = QFileDialog::getExistingDirectory(
             this, "Choose a folder to scan for games", browseStartDir(),
             QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
         if (root.isEmpty())
             return;
+        lastGameDir = QFileInfo(root).absoluteFilePath();
+        scanAndAdd(root);
+    }
 
-        const int maxResults = 200;
-        QVector<QPair<QString, QString>> found; // {display name, path}
-        QString why;
-        if (looksLikeGame(root, &why))
-            found.append({QFileInfo(root).fileName(), root});
-        const QFileInfoList level1 = QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-        for (const QFileInfo &d1 : level1) {
-            if (found.size() >= maxResults)
-                break;
-            QString w1;
-            if (looksLikeGame(d1.absoluteFilePath(), &w1)) {
-                found.append({d1.fileName(), d1.absoluteFilePath()});
-                continue; // don't also descend into a folder that is itself a game
+    // Scans `root` (with a Cancel button: a big or slow drive must not freeze the
+    // window) and lets the user tick which of the games found to add.
+    void scanAndAdd(const QString &root) {
+        QProgressDialog wait("Looking for games...", "Cancel", 0, 0, this);
+        wait.setWindowModality(Qt::WindowModal);
+        wait.setMinimumDuration(0);
+        wait.setAutoClose(false);
+        wait.setAutoReset(false);
+        wait.show();
+        bool cancelled = false;
+        connect(&wait, &QProgressDialog::canceled, &wait, [&cancelled]() { cancelled = true; });
+        int ticks = 0;
+        const ScanResult res = ScanForGames(root, 500, 20000, [&](const QString &dir) {
+            if ((++ticks & 7) == 1) { // let the window breathe without paying for it every folder
+                wait.setLabelText("Looking for games...\n" + QFileInfo(dir).fileName());
+                QCoreApplication::processEvents();
             }
-            const QFileInfoList level2 = QDir(d1.absoluteFilePath()).entryInfoList(
-                QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-            for (const QFileInfo &d2 : level2) {
-                if (found.size() >= maxResults)
-                    break;
-                QString w2;
-                if (looksLikeGame(d2.absoluteFilePath(), &w2))
-                    found.append({d1.fileName(), d2.absoluteFilePath()});
-            }
-        }
+            return !cancelled;
+        });
+        wait.close();
 
-        if (found.isEmpty()) {
+        if (res.found.isEmpty()) {
             QMessageBox::information(this, "No games found",
-                                     "No AGS game data was found directly under, or one level under:\n" + root);
+                res.stopped ? QString("The scan was cancelled before it found any game.")
+                            : "No AGS game data was found in, or up to two levels under:\n" + root +
+                              (res.capped ? QString("\n\n(The scan stopped at its limit of %1 folders.)").arg(res.visited)
+                                          : QString()));
             return;
         }
 
         QDialog dlg(this);
-        dlg.setWindowTitle(found.size() >= maxResults ? "Choose a game (stopped at 200 results)" : "Choose a game");
+        dlg.setObjectName("scanResults");
+        int fresh = 0;
+        for (const auto &g : res.found)
+            fresh += !inLibrary(g.second);
+        dlg.setWindowTitle(QString("Games found: %1 (%2 new)").arg(res.found.size()).arg(fresh));
         QVBoxLayout *l = new QVBoxLayout(&dlg);
-        QListWidget *list = new QListWidget(&dlg);
-        for (const auto &g : found) {
-            QListWidgetItem *item = new QListWidgetItem(g.first + "    " + g.second, list);
-            item->setData(Qt::UserRole, g.second);
+        if (res.stopped || res.capped) {
+            QLabel *note = new WrapLabel(res.stopped ? "The scan was cancelled, so this list is partial."
+                                                     : "The scan stopped at its limit, so this list is partial. "
+                                                       "Scan a narrower folder to see the rest.", &dlg);
+            l->addWidget(note);
         }
-        list->setCurrentRow(0);
+        QListWidget *list = new QListWidget(&dlg);
+        list->setObjectName("scanList");
+        list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        for (const auto &g : res.found) {
+            const bool have = inLibrary(g.second);
+            QListWidgetItem *item = new QListWidgetItem(
+                g.first + "    " + g.second + (have ? "    (already in the library)" : ""), list);
+            item->setData(Qt::UserRole, g.second);
+            if (have)
+                item->setFlags(item->flags() & ~(Qt::ItemIsSelectable | Qt::ItemIsEnabled));
+        }
         l->addWidget(list, 1);
-        QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Cancel, &dlg);
+        QPushButton *addBtn = bb->addButton("Add selected", QDialogButtonBox::AcceptRole);
+        addBtn->setEnabled(false);
+        QPushButton *allBtn = bb->addButton("Select all new", QDialogButtonBox::ActionRole);
+        allBtn->setEnabled(fresh > 0);
+        connect(list, &QListWidget::itemSelectionChanged, &dlg, [list, addBtn]() {
+            addBtn->setEnabled(!list->selectedItems().isEmpty());
+        });
+        connect(allBtn, &QPushButton::clicked, &dlg, [list]() { list->selectAll(); });
         connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
         connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-        connect(list, &QListWidget::itemDoubleClicked, &dlg, &QDialog::accept);
+        connect(list, &QListWidget::itemDoubleClicked, &dlg, [&dlg](QListWidgetItem *item) {
+            if (item->flags() & Qt::ItemIsSelectable)
+                dlg.accept();
+        });
         l->addWidget(bb);
-        dlg.resize(560, 420);
-        if (dlg.exec() == QDialog::Accepted && list->currentItem()) {
-            lastGameDir = QFileInfo(root).absoluteFilePath();
-            selectGame(list->currentItem()->data(Qt::UserRole).toString());
+        dlg.resize(620, 440);
+        if (dlg.exec() != QDialog::Accepted)
+            return;
+
+        QStringList chosen;
+        for (const QListWidgetItem *item : list->selectedItems())
+            chosen << item->data(Qt::UserRole).toString();
+        if (chosen.isEmpty())
+            return;
+        int added = 0;
+        for (const QString &path : chosen)
+            added += addGameToLibrary(path);
+        refreshLibrary();
+        if (chosen.size() == 1) {
+            switchToGame(chosen.first()); // one game: open it right away (asks about unsaved changes first)
+            return;
         }
+        QMessageBox::information(this, "Games library",
+            QString("%1 game(s) added to the library.").arg(added) +
+            (added < chosen.size() ? QString("\n%1 could not be added.").arg(chosen.size() - added) : QString()));
+        if (currentGame.isEmpty())
+            selectGame(chosen.first()); // nothing was open: start with the first one
     }
 
     // Removes every OTHER configured game's saved settings (.cfg, .log,

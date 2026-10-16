@@ -229,14 +229,20 @@ insieme nella stessa cartella.
 2. Scegli il gioco dalla **libreria** a sinistra, oppure aggiungine uno con
    **Add game...** (o con **Browse...** in alto): *Game folder...*, *Game data
    file...* (`.ags`, `.exe`, `ac2game.dat`) oppure *Scan a folder for games...*
-   (utile per una raccolta con tanti giochi: cerca nella cartella scelta e un
-   livello sotto, poi fai scegliere quale aprire). Un gioco entra in libreria
+   (utile per una raccolta con tanti giochi: cerca nella cartella scelta e fino a
+   due livelli sotto, con un **Cancel** se il disco è grande o lento — la ricerca
+   si ferma comunque a 20000 cartelle o 500 giochi e lo dice. Poi scegli **uno o
+   più** giochi da aggiungere: quelli già in libreria sono mostrati ma non
+   selezionabili, **Select all new** prende tutti gli altri. Con un solo gioco
+   questo si apre subito; con più giochi vengono aggiunti alla libreria senza
+   cambiare quello aperto). Un gioco entra in libreria
    la prima volta che lo apri, senza bisogno di premere Save.
 
    La lista è ordinata per nome e filtrabile (campo **Filter...**); due giochi
    con lo stesso nome si distinguono dalla cartella che li contiene, e uno la
    cui cartella non c'è più (un disco non montato) resta in grigio con
-   "(missing)". Passando a un altro gioco con modifiche non salvate viene
+   "(missing)" — lo stato si aggiorna da solo quando torni sulla finestra, quindi
+   basta montare il disco, senza riavviare nulla. Passando a un altro gioco con modifiche non salvate viene
    chiesto se salvarle. **Remove** (o il menu del tasto destro) toglie il gioco
    selezionato dalla libreria cancellando le sue impostazioni salvate qui — mai
    i file del gioco — e *Remove all other games...* toglie tutti tranne quello

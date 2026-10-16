@@ -277,6 +277,151 @@ void testLibraryCap(const QString &work) {
           "what is cut is the last by name, not an arbitrary one");
 }
 
+// Drives the "games found" dialog: remembers what it showed, then ticks the
+// games like a user would ("Select all new" or the entries given) and presses Add.
+struct ScanDialogDriver : QObject {
+    QStringList shown;          // item texts
+    QList<bool> selectable;     // per item
+    QString title;
+    QStringList pick;           // if not empty: select exactly the items whose path ends with one of these
+    QTimer timer;
+
+    ScanDialogDriver() {
+        timer.setInterval(40);
+        connect(&timer, &QTimer::timeout, this, [this]() {
+            for (QWidget *top : QApplication::topLevelWidgets()) {
+                if (top->objectName() != "scanResults" || !top->isVisible())
+                    continue;
+                auto *list = top->findChild<QListWidget *>("scanList");
+                title = top->windowTitle();
+                for (int i = 0; i < list->count(); ++i) {
+                    shown << list->item(i)->text();
+                    selectable << bool(list->item(i)->flags() & Qt::ItemIsSelectable);
+                }
+                if (pick.isEmpty()) {
+                    for (QPushButton *b : top->findChildren<QPushButton *>())
+                        if (b->text() == "Select all new")
+                            b->click();
+                } else {
+                    for (int i = 0; i < list->count(); ++i)
+                        for (const QString &suffix : pick)
+                            if (list->item(i)->data(Qt::UserRole).toString().endsWith(suffix))
+                                list->item(i)->setSelected(true);
+                }
+                for (QPushButton *b : top->findChildren<QPushButton *>())
+                    if (b->text() == "Add selected")
+                        b->click();
+                timer.stop();
+            }
+        });
+        timer.start();
+    }
+};
+
+void testScan(AGSSetup &w, const QString &work) {
+    std::puts("== scan: bounded, cancellable, marks what is already there, adds several");
+    Clicker clicker;
+    const QString root = work + "/scan";
+    makeGame(root + "/G1");
+    makeGame(root + "/G2");
+    makeGame(root + "/Collection/G3");
+    const QString existing = makeGame(root + "/Existing");
+    writeFile(root + "/empty/readme.txt", "nothing");
+    makeGame(root + "/deep/a/b/G4"); // three levels down: out of reach on purpose
+    w.selectGame(existing);
+    IniFile ei;
+    ei.load(w.cfgPath);
+    ei.setValue("zz", "marker", "keep-me");
+    ei.save(w.cfgPath);
+    const QString existingCfg = w.cfgPath;
+    const QString open = w.currentGame;
+
+    ScanResult r = ScanForGames(root, 500, 20000, nullptr);
+    QStringList names;
+    for (const auto &f : r.found)
+        names << QFileInfo(f.second).fileName();
+    names.sort();
+    check(names == QStringList({"Existing", "G1", "G2", "G3"}), "finds games in the folder and up to two levels down: " + names.join(","));
+    check(!r.stopped && !r.capped, "a normal scan is complete");
+    r = ScanForGames(root, 2, 20000, nullptr);
+    check(r.capped && r.found.size() == 2, "the result limit is honoured and reported");
+    r = ScanForGames(root, 500, 3, nullptr);
+    check(r.capped && r.visited == 3, "the folder limit is honoured and reported");
+    int calls = 0;
+    r = ScanForGames(root, 500, 20000, [&](const QString &) { return ++calls < 3; });
+    check(r.stopped && calls == 3, "returning false from the progress callback stops the scan (Cancel)");
+
+    // the dialog: Existing is shown but cannot be picked; the others are added together
+    {
+        ScanDialogDriver drv;
+        w.scanAndAdd(root);
+        check(drv.shown.size() == 4, "the dialog lists the four games");
+        int unselectable = 0;
+        for (int i = 0; i < drv.shown.size(); ++i)
+            if (!drv.selectable[i]) {
+                ++unselectable;
+                check(drv.shown[i].contains("Existing") && drv.shown[i].contains("already in the library"),
+                      "the one already in the library is marked");
+            }
+        check(unselectable == 1, "only that one is not selectable");
+        check(drv.title.contains("3 new"), "the title counts the new ones: " + drv.title);
+    }
+    for (const char *n : {"G1", "G2", "G3"}) {
+        const QString game = QFileInfo(QString(root + (QString(n) == "G3" ? "/Collection/" : "/") + n)).absoluteFilePath();
+        const QString cfg = QDir(configDir()).filePath(gameKey(game) + ".cfg");
+        IniFile i;
+        check(i.load(cfg) && i.value("librabridge", "game_path") == game && i.value("misc", "title") == "Test",
+              QString("%1 is in the library with its acsetup.cfg as the starting point").arg(n));
+        check(itemFor(w, game) != nullptr, QString("%1 shows in the list").arg(n));
+    }
+    IniFile still;
+    still.load(existingCfg);
+    check(still.value("zz", "marker") == "keep-me", "the game that was already there keeps its settings");
+    check(w.currentGame == open, "the open game stays open when several are added");
+    check(!QFileInfo::exists(QDir(configDir()).filePath(gameKey(root + "/empty") + ".cfg")), "a folder without a game is not added");
+
+    // a single new game is opened right away
+    const QString solo = makeGame(work + "/scan2/Solo");
+    {
+        ScanDialogDriver drv;
+        w.scanAndAdd(work + "/scan2");
+        check(drv.title.contains("1 new"), "second scan: one game");
+    }
+    check(w.currentGame == solo, "a single game added from a scan is opened");
+
+    // nothing there: a message, no dialog
+    clicker.seen.clear();
+    QDir().mkpath(work + "/scan3/nothing");
+    w.scanAndAdd(work + "/scan3");
+    check(clicker.seen.contains("No games found"), "an empty folder says no games were found");
+}
+
+void testMissingMarks(AGSSetup &w, const QString &work) {
+    std::puts("== library: (missing) follows the disk when the window is activated");
+    Clicker clicker;
+    const QString game = makeGame(work + "/marks/Markable");
+    check(w.addGameToLibrary(game) && !w.addGameToLibrary(game), "a game is added once, not twice");
+    w.refreshLibrary();
+    QListWidgetItem *item = itemFor(w, game);
+    check(item && !item->text().contains("missing"), "present: no mark");
+    w.libraryFilter->setText("Markable");
+    w.libraryList->setCurrentItem(item);
+    check(w.libraryLocateBtn->isHidden(), "no Locate button for a present game");
+
+    QDir().rename(game, work + "/marks/Markable-away");
+    QEvent activate(QEvent::WindowActivate);
+    QCoreApplication::sendEvent(&w, &activate);
+    check(itemFor(w, game) == item && item->text().contains("(missing)"), "the mark appears without rebuilding the list");
+    check(w.libraryList->currentItem() == item, "the selection is untouched");
+    check(!w.libraryLocateBtn->isHidden(), "the Locate button appears for it");
+    check(w.libraryFilter->text() == "Markable", "and the filter is untouched");
+
+    QDir().rename(work + "/marks/Markable-away", game);
+    QCoreApplication::sendEvent(&w, &activate);
+    check(!item->text().contains("missing") && w.libraryLocateBtn->isHidden(), "the mark goes away when the folder is back");
+    w.libraryFilter->clear();
+}
+
 void testParams(AGSSetup &w, const QString &work) {
     std::puts("== shader parameters: storage and hand-over to the engine");
     check(FormatParams(ParseParams("A=1;B=0.5")) == "A=1;B=0.5", "format/parse round trip");
@@ -513,6 +658,8 @@ int main(int argc, char **argv) {
     testLocate(w, work);
     testLocateOpenGameWithEdits(w, work);
     testLibraryCap(work);
+    testScan(w, work);
+    testMissingMarks(w, work);
     testParams(w, work);
     testListParams(work, haveLibra);
     testDownload(w, work);
