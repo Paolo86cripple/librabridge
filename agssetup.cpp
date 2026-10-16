@@ -83,6 +83,17 @@
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
 #include <QSet>
+#include <QDoubleSpinBox>
+#include <QImage>
+#include <QMap>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QUrl>
+#include <QDirIterator>
+#include <QImageReader>
+#include <QGridLayout>
+#include <cmath>
 #include <functional>
 #include <vector>
 #include <cstring>
@@ -467,6 +478,100 @@ const void *QtGLProcLoader(const char *name) {
     return ctx ? reinterpret_cast<const void *>(ctx->getProcAddress(name)) : nullptr;
 }
 
+// librashader's own message for an error, freed right after reading it. Falls
+// back to a generic line if the library lacks error_write (older ABI).
+QString DescribeLibraError(libra_error_t err) {
+    QString text;
+    char *msg = nullptr;
+    const libra_instance_t &libra = PreviewLibra();
+    if (err && libra.error_write && libra.error_write(err, &msg) == 0 && msg) {
+        text = QString::fromUtf8(msg);
+        if (libra.error_free_string)
+            libra.error_free_string(&msg);
+    }
+    if (err && libra.error_free)
+        libra.error_free(&err);
+    return text.isEmpty() ? QString("unknown error") : text;
+}
+
+// ---- shader parameters ----------------------------------------------------
+// A slang shader declares tweakable values (#pragma parameter). They are stored
+// per game as one string, "NAME=value;NAME2=value", holding only the values that
+// differ from the preset's own defaults, and handed to the engine bridge through
+// the AGS_LIBRASHADER_PARAMS environment variable in that same form.
+using ParamMap = QMap<QString, double>;
+
+bool ValidParamName(const QString &name) {
+    return !name.isEmpty() && !name.contains(';') && !name.contains('=');
+}
+
+ParamMap ParseParams(const QString &spec) {
+    ParamMap out;
+    for (const QString &item : spec.split(';', Qt::SkipEmptyParts)) {
+        const int eq = item.indexOf('=');
+        if (eq <= 0)
+            continue;
+        const QString name = item.left(eq).trimmed();
+        bool ok = false;
+        const double v = item.mid(eq + 1).trimmed().toDouble(&ok);
+        if (ok && ValidParamName(name))
+            out.insert(name, v);
+    }
+    return out;
+}
+
+QString FormatParams(const ParamMap &params) {
+    QStringList parts;
+    for (auto it = params.constBegin(); it != params.constEnd(); ++it)
+        parts << it.key() + "=" + QString::number(it.value(), 'g', 9);
+    return parts.join(';');
+}
+
+struct ShaderParam {
+    QString name, description;
+    double initial = 0, minimum = 0, maximum = 1, step = 0.01;
+};
+
+// Asks librashader what the preset exposes (it resolves #reference chains,
+// #include files and the preset's own overrides, which a hand-written parser
+// would only approximate).
+QVector<ShaderParam> ListPresetParams(const QString &presetPath, QString *error) {
+    QVector<ShaderParam> out;
+    const libra_instance_t &libra = PreviewLibra();
+    if (!libra.instance_loaded) {
+        *error = DescribeLibraryProblem();
+        return out;
+    }
+    libra_shader_preset_t preset = nullptr;
+    libra_error_t err = libra.preset_create(presetPath.toUtf8().constData(), &preset);
+    if (err || !preset) {
+        *error = "Could not parse the preset: " + DescribeLibraError(err);
+        return out;
+    }
+    libra_preset_param_list_t list{};
+    err = libra.preset_get_runtime_params(&preset, &list);
+    if (err) {
+        *error = "Could not read the preset's parameters: " + DescribeLibraError(err);
+    } else {
+        for (uint64_t i = 0; i < list.length; ++i) {
+            const libra_preset_param_t &p = list.parameters[i];
+            ShaderParam sp;
+            sp.name = QString::fromUtf8(p.name ? p.name : "");
+            if (!ValidParamName(sp.name))
+                continue;
+            sp.description = QString::fromUtf8(p.description ? p.description : "").trimmed();
+            sp.initial = p.initial;
+            sp.minimum = p.minimum;
+            sp.maximum = p.maximum;
+            sp.step = p.step;
+            out.append(sp);
+        }
+        libra.preset_free_runtime_params(list);
+    }
+    libra.preset_free(&preset);
+    return out;
+}
+
 } // namespace
 
 class ShaderPreview : public QOpenGLWidget, protected QOpenGLFunctions {
@@ -474,8 +579,8 @@ class ShaderPreview : public QOpenGLWidget, protected QOpenGLFunctions {
 public:
     explicit ShaderPreview(QWidget *parent = nullptr) : QOpenGLWidget(parent) {
         setFixedSize(kPreviewW * kPreviewScale, kPreviewH * kPreviewScale);
-        setToolTip("Renders a built-in test pattern through the selected preset.\n"
-                  "Always uses OpenGL here, regardless of the Renderer setting above.");
+        setToolTip("Renders a built-in test pattern (or the picture chosen below) through the\n"
+                  "selected preset. Always uses OpenGL here, regardless of the Renderer setting above.");
     }
 
     ~ShaderPreview() override {
@@ -487,6 +592,8 @@ public:
             glDeleteProgram(prog);
         if (patternTex)
             glDeleteTextures(1, &patternTex);
+        if (imageTex)
+            glDeleteTextures(1, &imageTex);
         if (outTex)
             glDeleteTextures(1, &outTex);
         doneCurrent();
@@ -504,6 +611,26 @@ public:
 
     QString statusText() const { return status; }
 
+    // Parameter values the preview applies to the chain (when it is built, and
+    // live afterwards). Values not listed keep the preset's own defaults.
+    void setParameters(const ParamMap &values) { params = values; }
+    void setParameterValue(const QString &name, double value) {
+        params[name] = value;
+        if (chain) {
+            applyParam(name, value);
+            update();
+        }
+    }
+
+    // Image shown instead of the built-in test pattern; empty = the pattern.
+    void setSourceImage(const QString &path) {
+        if (path == requestedImage)
+            return;
+        requestedImage = path;
+        imagePending = true;
+        update();
+    }
+
 signals:
     void statusChanged();
 
@@ -515,7 +642,7 @@ protected:
         // and calling any GL function without initializeOpenGLFunctions() having
         // actually bound one crashes. Every method below checks glReady first.
         if (!QOpenGLContext::currentContext()) {
-            status = "OpenGL is not available in this session - no preview.";
+            setStatus("OpenGL is not available in this session - no preview.");
             return;
         }
         initializeOpenGLFunctions();
@@ -524,7 +651,7 @@ protected:
         buildProgram();
         buildPatternTexture();
         buildOutputTexture();
-        status = "No preset selected - showing the test pattern.";
+        setStatus("No preset selected - showing the test pattern.");
     }
 
     void resizeGL(int, int) override {}
@@ -532,33 +659,50 @@ protected:
     void paintGL() override {
         if (!glReady)
             return;
+        if (imagePending) {
+            imagePending = false;
+            loadSourceImage();
+        }
         if (rebuildPending) {
             rebuildPending = false;
             rebuildChain();
         }
 
-        glViewport(0, 0, width(), height());
+        // The framebuffer is measured in device pixels, which on a high-DPI screen
+        // is more than width()/height(). The picture is drawn at the source's
+        // aspect ratio, as large as fits (letterboxed), and the filter chain
+        // renders straight at that size - like the engine does for a window.
+        const qreal dpr = devicePixelRatioF();
+        const int fbW = qMax(1, qRound(width() * dpr)), fbH = qMax(1, qRound(height() * dpr));
+        const double scale = qMin(double(fbW) / srcW, double(fbH) / srcH);
+        const int outW = qMax(1, qRound(srcW * scale)), outH = qMax(1, qRound(srcH * scale));
+        const int x0 = (fbW - outW) / 2, y0 = (fbH - outH) / 2;
+
+        glViewport(0, 0, fbW, fbH);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        GLuint show = patternTex;
+        const GLuint src = sourceTexture();
+        GLuint show = src;
+        bool smooth = qAbs(scale - qRound(scale)) > 0.01; // blocky pixels only at whole-number zoom
         if (chain) {
+            ensureOutputTexture(outW, outH);
             // Same fix as the engine bridge: a texture with a single mip level is
             // mipmap-incomplete under the default GL_TEXTURE_MAX_LEVEL, and
             // librashader's sampler may use a mipmapped filter.
-            glBindTexture(GL_TEXTURE_2D, patternTex);
+            glBindTexture(GL_TEXTURE_2D, src);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
 
             libra_image_gl_t image{};
-            image.handle = patternTex;
+            image.handle = src;
             image.format = GL_RGBA8;
-            image.width = kPreviewW;
-            image.height = kPreviewH;
+            image.width = srcW;
+            image.height = srcH;
             libra_image_gl_t out{};
             out.handle = outTex;
             out.format = GL_RGBA8;
-            out.width = kPreviewW;
-            out.height = kPreviewH;
+            out.width = outW;
+            out.height = outH;
 
             auto chainHandle = static_cast<libra_gl_filter_chain_t>(chain);
             // Presets using frame history/feedback look wrong (often just black)
@@ -578,23 +722,32 @@ protected:
             // this, the blit below lands on the wrong target/area and the widget
             // shows a partial or blank result.
             glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
-            glViewport(0, 0, width(), height());
+            glViewport(0, 0, fbW, fbH);
             glActiveTexture(GL_TEXTURE0); // hand the context back, same as the engine bridge
             glUseProgram(0);
             if (err) {
-                setStatus("Frame error: " + describeError(err) + " (falling back to the plain pattern).");
+                setStatus("Frame error: " + DescribeLibraError(err) + " (falling back to the plain picture).");
                 destroyChain();
             } else {
                 show = outTex;
+                smooth = false; // already at the size it is shown at
             }
         }
-        drawTexturedQuad(show);
+        glViewport(x0, y0, outW, outH);
+        drawTexturedQuad(show, smooth);
+        glViewport(0, 0, fbW, fbH);
     }
 
 private:
     static constexpr int kPreviewW = 320, kPreviewH = 180, kPreviewScale = 2;
 
-    QString pendingPreset, currentPreset, status;
+    QString pendingPreset, currentPreset, status, baseStatus, imageNote;
+    ParamMap params;
+    QString requestedImage;
+    bool imagePending = false;
+    int srcW = kPreviewW, srcH = kPreviewH; // size of the picture fed to the chain
+    int outTexW = 0, outTexH = 0;           // size currently allocated for outTex
+    GLuint imageTex = 0;
     bool rebuildPending = false;
     bool justRebuilt = false; // run a few extra frames once so history/feedback shaders settle
     bool glReady = false; // false if this session never gave the widget a working GL context
@@ -604,24 +757,72 @@ private:
     GLuint prog = 0, aPos = 0, aUV = 0, uTex = 0, patternTex = 0, outTex = 0, quadVbo = 0;
 
     void setStatus(const QString &text) {
-        status = text;
+        baseStatus = text;
+        composeStatus();
         emit statusChanged();
     }
 
-    // librashader's own message for an error, freed right after reading it.
-    // Falls back to a generic line if the vendored build lacks error_write
-    // (older ABI) or returns nothing.
-    QString describeError(libra_error_t err) {
-        QString text;
-        char *msg = nullptr;
-        if (PreviewLibra().error_write && PreviewLibra().error_write(err, &msg) == 0 && msg) {
-            text = QString::fromUtf8(msg);
-            if (PreviewLibra().error_free_string)
-                PreviewLibra().error_free_string(&msg);
+    void composeStatus() { status = imageNote.isEmpty() ? baseStatus : baseStatus + "\n" + imageNote; }
+
+    GLuint sourceTexture() const { return imageTex ? imageTex : patternTex; }
+
+    void applyParam(const QString &name, double value) {
+        if (!chain)
+            return;
+        auto handle = static_cast<libra_gl_filter_chain_t>(chain);
+        libra_error_t err = PreviewLibra().gl_filter_chain_set_param(
+            &handle, name.toUtf8().constData(), static_cast<float>(value));
+        if (err && PreviewLibra().error_free)
+            PreviewLibra().error_free(&err); // a name this preset does not have: nothing to do
+    }
+
+    void applyAllParams() {
+        for (auto it = params.constBegin(); it != params.constEnd(); ++it)
+            applyParam(it.key(), it.value());
+    }
+
+    void ensureOutputTexture(int w, int h) {
+        if (w == outTexW && h == outTexH)
+            return;
+        glBindTexture(GL_TEXTURE_2D, outTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        outTexW = w;
+        outTexH = h;
+    }
+
+    void loadSourceImage() {
+        if (imageTex) {
+            glDeleteTextures(1, &imageTex);
+            imageTex = 0;
         }
-        if (PreviewLibra().error_free)
-            PreviewLibra().error_free(&err);
-        return text.isEmpty() ? "unknown error" : text;
+        srcW = kPreviewW;
+        srcH = kPreviewH;
+        imageNote.clear();
+        justRebuilt = true; // history/feedback shaders need to settle on the new picture
+        if (!requestedImage.isEmpty()) {
+            QImage img(requestedImage);
+            if (img.isNull()) {
+                imageNote = "Could not read the image " + QFileInfo(requestedImage).fileName() +
+                            " - showing the test pattern.";
+            } else {
+                if (img.width() > 4096 || img.height() > 4096)
+                    img = img.scaled(4096, 4096, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                img = img.convertToFormat(QImage::Format_RGBA8888).mirrored(false, true); // GL rows run bottom-up
+                glGenTextures(1, &imageTex);
+                glBindTexture(GL_TEXTURE_2D, imageTex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.width(), img.height(), 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, img.constBits());
+                srcW = img.width();
+                srcH = img.height();
+            }
+        }
+        composeStatus();
+        emit statusChanged();
     }
 
     void destroyChain() {
@@ -668,7 +869,7 @@ private:
         libra_shader_preset_t preset = nullptr;
         libra_error_t err = libra.preset_create(currentPreset.toUtf8().constData(), &preset);
         if (err || !preset) {
-            setStatus(err ? "Could not parse the preset: " + describeError(err)
+            setStatus(err ? "Could not parse the preset: " + DescribeLibraError(err)
                          : "Could not parse the preset.");
             return;
         }
@@ -684,10 +885,11 @@ private:
         err = libra.gl_filter_chain_create(&preset, &QtGLProcLoader, &opts, &newChain);
         if (err || !newChain) {
             setStatus(QString("Failed to build the filter chain (GLSL %1): ").arg(opts.glsl_version) +
-                     (err ? describeError(err) : QString("unknown error")));
+                     (err ? DescribeLibraError(err) : QString("unknown error")));
             return;
         }
         chain = newChain;
+        applyAllParams();
         setStatus(QString("Loaded - GLSL %1.").arg(opts.glsl_version));
     }
 
@@ -732,7 +934,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
 
-    void drawTexturedQuad(GLuint tex) {
+    void drawTexturedQuad(GLuint tex, bool smooth) {
         glUseProgram(prog);
         glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
         glEnableVertexAttribArray(aPos);
@@ -741,8 +943,8 @@ private:
         glVertexAttribPointer(aUV, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<void *>(2 * sizeof(float)));
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
         glUniform1i(uTex, 0);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glDisableVertexAttribArray(aPos);
@@ -797,7 +999,7 @@ private:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kPreviewW, kPreviewH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        // storage is (re)allocated by ensureOutputTexture() at the size it is shown at
     }
 };
 
@@ -895,6 +1097,12 @@ private:
 
     QCheckBox *shaderEnabled = nullptr;
     QLineEdit *shaderPath = nullptr;
+    QString shaderParams;      // "NAME=value;..." overrides of the preset's parameters (see ParseParams)
+    QString previewImagePath;  // picture the preview uses instead of the test pattern
+    QPushButton *paramsBtn = nullptr;
+    QPushButton *previewImageBtn = nullptr;
+    QPushButton *previewPatternBtn = nullptr;
+    QPushButton *libraryLocateBtn = nullptr;
     QWidget *shaderPane = nullptr;
     ShaderPreview *shaderPreview = nullptr;
     WrapLabel *previewStatus = nullptr;
@@ -1248,7 +1456,13 @@ private:
         QPushButton *browseBtn = new QPushButton("Browse...", this);
         QPushButton *clearBtn = new QPushButton("Clear", this);
         connect(browseBtn, &QPushButton::clicked, this, &AGSSetup::browseShader);
-        connect(clearBtn, &QPushButton::clicked, shaderPath, &QLineEdit::clear);
+        connect(clearBtn, &QPushButton::clicked, this, [this]() { setShaderPreset(QString()); });
+        // Parameters belong to one preset: typing another path starts from its defaults.
+        connect(shaderPath, &QLineEdit::textEdited, this, [this]() {
+            shaderParams.clear();
+            updateParamsButton();
+        });
+        connect(shaderPath, &QLineEdit::textChanged, this, [this]() { updateParamsButton(); });
         row->addWidget(shaderPath, 1);
         row->addWidget(browseBtn);
         row->addWidget(clearBtn);
@@ -1257,9 +1471,29 @@ private:
             [this](const QString &v) { shaderPath->setText(v); },
             [this]() { return shaderPath->text().trimmed(); }});
 
+        bindings.append({"librabridge", "shader_params", QString(), true,
+            [this](const QString &v) { shaderParams = FormatParams(ParseParams(v)); updateParamsButton(); },
+            [this]() { return shaderParams; }});
+        bindings.append({"librabridge", "preview_image", QString(), true,
+            [this](const QString &v) { previewImagePath = v; updatePreviewImageButtons(); },
+            [this]() { return previewImagePath; }});
+
+        QHBoxLayout *toolsRow = new QHBoxLayout();
         QPushButton *dirBtn = new QPushButton("Browse Shader Directory...", this);
         connect(dirBtn, &QPushButton::clicked, this, &AGSSetup::showShaderBrowser);
-        sl->addWidget(dirBtn);
+        QPushButton *getBtn = new QPushButton("Get shaders...", this);
+        getBtn->setToolTip("Download the RetroArch slang shader collection (libretro/slang-shaders)\n"
+                           "into your user folder, so there is something to pick from.");
+        connect(getBtn, &QPushButton::clicked, this, &AGSSetup::downloadShaders);
+        paramsBtn = new QPushButton("Shader parameters...", this);
+        paramsBtn->setToolTip("Adjust the values the preset exposes (scanline strength, curvature, ...).\n"
+                              "They are saved for this game and applied when it starts.");
+        connect(paramsBtn, &QPushButton::clicked, this, &AGSSetup::editShaderParameters);
+        toolsRow->addWidget(dirBtn);
+        toolsRow->addWidget(getBtn);
+        toolsRow->addWidget(paramsBtn);
+        sl->addLayout(toolsRow);
+        updateParamsButton();
 
         QLabel *note = new WrapLabel(
             "Presets are RetroArch .slangp files (libretro/slang-shaders). Legacy GLSL .glslp and Cg "
@@ -1304,17 +1538,23 @@ private:
         previewRefreshBtn->setToolTip("Runs the preset above on a built-in test pattern, so it can be\n"
                                       "sanity-checked without starting the game. Does not update on its\n"
                                       "own when the preset field changes.");
-        connect(previewRefreshBtn, &QPushButton::clicked, this, [this]() {
-            shaderPreview->refresh(shaderPath->text().trimmed());
-        });
+        connect(previewRefreshBtn, &QPushButton::clicked, this, [this]() { refreshShaderPreview(); });
         connect(shaderPreview, &ShaderPreview::statusChanged, this, [this]() {
             previewStatus->setText(shaderPreview->statusText());
         });
         QHBoxLayout *btnRow = new QHBoxLayout();
         btnRow->addStretch(1);
         btnRow->addWidget(previewRefreshBtn);
+        previewImageBtn = new QPushButton("Preview image...", previewBox);
+        previewImageBtn->setToolTip("Run the preset on a screenshot of your game instead of the test pattern.");
+        connect(previewImageBtn, &QPushButton::clicked, this, &AGSSetup::choosePreviewImage);
+        previewPatternBtn = new QPushButton("Use test pattern", previewBox);
+        connect(previewPatternBtn, &QPushButton::clicked, this, &AGSSetup::clearPreviewImage);
+        btnRow->addWidget(previewImageBtn);
+        btnRow->addWidget(previewPatternBtn);
         btnRow->addStretch(1);
         pl->addLayout(btnRow);
+        updatePreviewImageButtons();
         sl->addWidget(previewBox);
 
         lay->addWidget(shaderPane);
@@ -1862,13 +2102,35 @@ private:
         row->addWidget(addBtn, 1);
         row->addWidget(libraryRemoveBtn);
         l->addLayout(row);
+
+        // Shown only while the selected game's files cannot be found: points the
+        // entry at where they are now, keeping its saved settings.
+        libraryLocateBtn = new QPushButton("Locate missing game...", panel);
+        libraryLocateBtn->setToolTip("The game's files are not where they were. Say where they are now;\n"
+                                     "its saved settings are kept.");
+        QMenu *locateMenu = new QMenu(libraryLocateBtn);
+        connect(locateMenu->addAction("Game data file (.ags, .exe, ac2game.dat)..."), &QAction::triggered, this,
+                [this]() { if (QListWidgetItem *it = libraryList->currentItem()) relocateLibraryGame(it, false); });
+        connect(locateMenu->addAction("Game folder..."), &QAction::triggered, this,
+                [this]() { if (QListWidgetItem *it = libraryList->currentItem()) relocateLibraryGame(it, true); });
+        libraryLocateBtn->setMenu(locateMenu);
+        l->addWidget(libraryLocateBtn);
         updateLibraryButtons();
         return panel;
     }
 
+    static bool libraryItemMissing(const QListWidgetItem *item) {
+        return item && !QFileInfo::exists(item->data(Qt::UserRole).toString());
+    }
+
     void updateLibraryButtons() {
-        if (libraryRemoveBtn && libraryList)
-            libraryRemoveBtn->setEnabled(libraryList->currentItem() != nullptr);
+        if (!libraryList)
+            return;
+        const QListWidgetItem *cur = libraryList->currentItem();
+        if (libraryRemoveBtn)
+            libraryRemoveBtn->setEnabled(cur != nullptr);
+        if (libraryLocateBtn)
+            libraryLocateBtn->setVisible(libraryItemMissing(cur));
     }
 
     void refreshLibrary() {
@@ -2013,15 +2275,88 @@ private:
         refreshLibrary();
     }
 
+    // Points a library entry at the game's new location. Its settings follow it:
+    // they are kept per game under a name derived from the game's path, so the
+    // settings file is rewritten under the new name (and the old one deleted).
+    void relocateLibraryGame(QListWidgetItem *item, bool folder) {
+        const QString oldPath = item->data(Qt::UserRole).toString();
+
+        QString start = QFileInfo(oldPath).absolutePath();
+        while (start.size() > 1 && !QFileInfo(start).isDir())
+            start = QFileInfo(start).absolutePath();
+        if (!QFileInfo(start).isDir())
+            start = browseStartDir();
+
+        const QString picked = folder
+            ? QFileDialog::getExistingDirectory(this, "Where is this game's folder now?", start,
+                                                QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks)
+            : QFileDialog::getOpenFileName(this, "Where is this game's data file now?", start,
+                                           "AGS game data (*.ags *.exe ac2game.dat agsgame.dat);;All files (*)");
+        if (picked.isEmpty())
+            return;
+        relocateTo(item, picked);
+    }
+
+    // The part of "Locate" after the user has said where the game is now.
+    void relocateTo(QListWidgetItem *item, const QString &picked) {
+        const QString oldPath = item->data(Qt::UserRole).toString();
+        const QString oldCfg = item->data(Qt::UserRole + 1).toString();
+        const QString newPath = normalizeUserPath(picked);
+        QString why;
+        if (!looksLikeGame(newPath, &why)) {
+            QMessageBox::warning(this, "Locate game", why);
+            return;
+        }
+        if (newPath == oldPath)
+            return;
+
+        const QString key = gameKey(newPath);
+        const QString newCfg = QDir(configDir()).filePath(key + ".cfg");
+        if (newCfg != oldCfg && QFileInfo::exists(newCfg) &&
+            QMessageBox::question(this, "Locate game",
+                "That game is already in the library with its own saved settings.\n\n"
+                "Replace them with the settings of \"" + item->text().trimmed() + "\"?") != QMessageBox::Yes)
+            return;
+
+        IniFile cfg;
+        if (!cfg.load(oldCfg)) {
+            QMessageBox::critical(this, "Locate game", "Could not read its saved settings:\n" + oldCfg);
+            return;
+        }
+        cfg.setValue("librabridge", "game_path", newPath);
+        if (!cfg.save(newCfg)) {
+            QMessageBox::critical(this, "Locate game", "Could not write:\n" + newCfg);
+            return;
+        }
+        if (newCfg != oldCfg) {
+            QString oldBase = oldCfg, newBase = newCfg;
+            oldBase.chop(4);
+            newBase.chop(4);
+            QFile::remove(newBase + ".log");
+            QFile::rename(oldBase + ".log", newBase + ".log"); // keeps the last-launch log with the game
+            QFile::remove(newBase + ".preview.cfg");
+            QFile::remove(oldCfg);
+            QFile::remove(oldBase + ".preview.cfg");
+        }
+        libraryFocus.clear();
+        refreshLibrary();
+        switchToGame(newPath); // open it right away (asks first if the open game has unsaved changes)
+    }
+
     void showLibraryMenu(const QPoint &pos) {
         QListWidgetItem *item = libraryList->itemAt(pos);
         QMenu menu(this);
+        const bool missing = libraryItemMissing(item);
+        QAction *locateFile = missing ? menu.addAction("Locate game data file...") : nullptr;
+        QAction *locateFolder = missing ? menu.addAction("Locate game folder...") : nullptr;
         QAction *removeThis = item ? menu.addAction("Remove from library...") : nullptr;
         QAction *removeOthers = menu.addAction("Remove all other games...");
         QAction *chosen = menu.exec(libraryList->viewport()->mapToGlobal(pos));
         if (!chosen)
             return;
-        if (chosen == removeThis)
+        if (chosen == locateFile || chosen == locateFolder)
+            relocateLibraryGame(item, chosen == locateFolder);
+        else if (chosen == removeThis)
             removeLibraryGame(item);
         else if (chosen == removeOthers)
             removeAllOtherGames();
@@ -2229,20 +2564,44 @@ private:
         refreshLibrary();
     }
 
+    // Where the shader file dialogs open: the last place used, else a collection
+    // that is already on the machine (downloaded here, or RetroArch's own).
+    static QString shadersHome() {
+        return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+               "/agssetup/slang-shaders";
+    }
+
     QString shaderStartDir() const {
-        if (!lastShaderDir.isEmpty())
+        if (!lastShaderDir.isEmpty() && QFileInfo(lastShaderDir).isDir())
             return lastShaderDir;
+        const QStringList known = {
+            shadersHome(),
+            QDir::homePath() + "/.config/retroarch/shaders/shaders_slang",
+            "/usr/share/libretro/shaders/shaders_slang",
+            "/usr/share/libretro/shaders"};
+        for (const QString &dir : known)
+            if (QFileInfo(dir).isDir())
+                return dir;
         return QDir::homePath();
+    }
+
+    // Chooses (or clears, with an empty path) the preset. The parameters saved
+    // for the previous preset do not apply to another one, so they are dropped.
+    void setShaderPreset(const QString &path) {
+        if (path != shaderPath->text().trimmed())
+            shaderParams.clear();
+        shaderPath->setText(path);
+        if (!path.isEmpty())
+            lastShaderDir = QFileInfo(path).path();
+        updateParamsButton();
     }
 
     void browseShader() {
         const QString path = QFileDialog::getOpenFileName(
             this, "Choose a RetroArch shader preset", shaderStartDir(),
             "Shader presets (*.slangp);;All files (*)");
-        if (!path.isEmpty()) {
-            shaderPath->setText(path);
-            lastShaderDir = QFileInfo(path).path();
-        }
+        if (!path.isEmpty())
+            setShaderPreset(path);
     }
 
     void showShaderBrowser() {
@@ -2254,10 +2613,379 @@ private:
         const QString path = QFileDialog::getOpenFileName(
             this, "Choose a shader preset", dir,
             "Shader presets (*.slangp);;All files (*)");
-        if (!path.isEmpty()) {
-            shaderPath->setText(path);
-            lastShaderDir = QFileInfo(path).path();
+        if (!path.isEmpty())
+            setShaderPreset(path);
+    }
+
+    // ----- shader parameters and the preview picture -----
+
+    void updateParamsButton() {
+        if (!paramsBtn)
+            return;
+        const int changed = ParseParams(shaderParams).size();
+        paramsBtn->setText(changed ? QString("Shader parameters... (%1 changed)").arg(changed)
+                                   : QString("Shader parameters..."));
+        const QString preset = shaderPath ? shaderPath->text().trimmed() : QString();
+        paramsBtn->setEnabled(!preset.isEmpty() && !IsLegacyPreset(preset));
+    }
+
+    void updatePreviewImageButtons() {
+        if (previewImageBtn)
+            previewImageBtn->setToolTip(previewImagePath.isEmpty()
+                ? QString("Run the preset on a screenshot of your game instead of the test pattern.")
+                : "Using: " + previewImagePath);
+        if (previewPatternBtn)
+            previewPatternBtn->setEnabled(!previewImagePath.isEmpty());
+    }
+
+    // Feeds the preview the current preset, parameters and picture, and rebuilds it.
+    void refreshShaderPreview() {
+        if (!shaderPreview)
+            return;
+        shaderPreview->setParameters(ParseParams(shaderParams));
+        shaderPreview->setSourceImage(previewImagePath);
+        shaderPreview->refresh(shaderPath->text().trimmed());
+    }
+
+    void choosePreviewImage() {
+        QStringList globs;
+        for (const QByteArray &fmt : QImageReader::supportedImageFormats())
+            globs << "*." + QString::fromLatin1(fmt).toLower();
+        const QString start = !previewImagePath.isEmpty() ? QFileInfo(previewImagePath).path()
+                              : !currentGame.isEmpty()    ? gameDirOf(currentGame)
+                                                          : QDir::homePath();
+        const QString f = QFileDialog::getOpenFileName(
+            this, "Choose a picture to preview the shader on", start,
+            "Images (" + globs.join(' ') + ");;All files (*)");
+        if (f.isEmpty())
+            return;
+        previewImagePath = f;
+        updatePreviewImageButtons();
+        refreshShaderPreview();
+    }
+
+    void clearPreviewImage() {
+        previewImagePath.clear();
+        updatePreviewImageButtons();
+        refreshShaderPreview();
+    }
+
+    // Number of decimals a spin box needs to show multiples of `step`.
+    static int decimalsForStep(double step) {
+        int d = 0;
+        double scaled = step;
+        while (d < 4 && qAbs(scaled - std::round(scaled)) > 1e-6) {
+            ++d;
+            scaled *= 10;
         }
+        return d;
+    }
+
+    void editShaderParameters() {
+        const QString preset = shaderPath->text().trimmed();
+        if (preset.isEmpty())
+            return;
+        if (IsLegacyPreset(preset)) {
+            QMessageBox::warning(this, "Shader parameters", LegacyPresetHint());
+            return;
+        }
+        if (!QFileInfo::exists(preset)) {
+            QMessageBox::warning(this, "Shader parameters", "The shader preset does not exist:\n" + preset);
+            return;
+        }
+        QString err;
+        const QVector<ShaderParam> list = ListPresetParams(preset, &err);
+        if (list.isEmpty()) {
+            QMessageBox::information(this, "Shader parameters",
+                err.isEmpty() ? QString("This preset has no adjustable parameters.") : err);
+            return;
+        }
+
+        // Only names this preset really has; the rest is stale.
+        const ParamMap saved = ParseParams(shaderParams);
+        ParamMap original, current;
+        for (const ShaderParam &p : list)
+            if (saved.contains(p.name))
+                original.insert(p.name, saved.value(p.name));
+        current = original;
+        refreshShaderPreview(); // so the picture behind the dialog is this preset
+
+        QDialog dlg(this);
+        dlg.setWindowTitle("Shader parameters - " + QFileInfo(preset).completeBaseName());
+        QVBoxLayout *root = new QVBoxLayout(&dlg);
+
+        QHBoxLayout *top = new QHBoxLayout();
+        QLineEdit *filter = new QLineEdit(&dlg);
+        filter->setPlaceholderText("Filter...");
+        filter->setClearButtonEnabled(true);
+        top->addWidget(filter, 1);
+        QPushButton *resetAll = new QPushButton("Reset all", &dlg);
+        top->addWidget(resetAll);
+        root->addLayout(top);
+
+        QScrollArea *scroll = new QScrollArea(&dlg);
+        scroll->setWidgetResizable(true);
+        QWidget *body = new QWidget(scroll);
+        QGridLayout *grid = new QGridLayout(body);
+        grid->setColumnStretch(0, 3);
+        grid->setColumnStretch(1, 4);
+
+        struct Row {
+            ShaderParam p;
+            QLabel *label;
+            QSlider *slider;
+            QDoubleSpinBox *spin;
+            QPushButton *reset;
+            QString haystack;
+        };
+        QVector<Row> rows;
+        rows.reserve(list.size());
+        for (int r = 0; r < list.size(); ++r) {
+            ShaderParam p = list[r];
+            if (!(p.maximum > p.minimum)) // nothing to adjust: show it, locked
+                p.maximum = p.minimum;
+            double step = p.step > 0 ? p.step : (p.maximum - p.minimum) / 100.0;
+            const bool locked = !(p.maximum > p.minimum);
+            if (step <= 0)
+                step = 1;
+            const int steps = locked ? 0 : qBound(1, int(std::lround((p.maximum - p.minimum) / step)), 10000);
+
+            Row row;
+            row.p = p;
+            row.label = new QLabel(p.description.isEmpty() ? p.name : p.description, body);
+            row.label->setWordWrap(true);
+            row.label->setToolTip(p.name + QString("  (%1 .. %2, default %3)")
+                .arg(p.minimum).arg(p.maximum).arg(p.initial));
+            row.slider = new QSlider(Qt::Horizontal, body);
+            row.slider->setRange(0, steps);
+            row.spin = new QDoubleSpinBox(body);
+            row.spin->setDecimals(decimalsForStep(step));
+            row.spin->setRange(p.minimum, p.maximum);
+            row.spin->setSingleStep(step);
+            row.spin->setKeyboardTracking(false);
+            row.reset = new QPushButton("Reset", body);
+            row.reset->setToolTip("Back to " + QString::number(p.initial));
+            row.haystack = p.name + " " + p.description;
+            row.slider->setEnabled(!locked);
+            row.spin->setEnabled(!locked);
+
+            const double start = current.contains(p.name) ? current.value(p.name) : p.initial;
+            row.spin->setValue(start);
+            row.slider->setValue(locked ? 0 : int(std::lround((qBound(p.minimum, start, p.maximum) - p.minimum) / step)));
+
+            grid->addWidget(row.label, r, 0);
+            grid->addWidget(row.slider, r, 1);
+            grid->addWidget(row.spin, r, 2);
+            grid->addWidget(row.reset, r, 3);
+            rows.append(row);
+        }
+        grid->setRowStretch(list.size(), 1);
+        scroll->setWidget(body);
+        root->addWidget(scroll, 1);
+
+        auto showChanged = [&current](const Row &row) {
+            QFont f = row.label->font();
+            f.setBold(current.contains(row.p.name));
+            row.label->setFont(f);
+        };
+        for (int r = 0; r < rows.size(); ++r) {
+            const Row row = rows[r];
+            const double step = row.slider->maximum() > 0
+                ? (row.p.maximum - row.p.minimum) / row.slider->maximum() : 1.0;
+            showChanged(row);
+            connect(row.spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dlg,
+                [this, row, step, &current, showChanged](double v) {
+                    if (row.slider->maximum() > 0) {
+                        const QSignalBlocker block(row.slider);
+                        row.slider->setValue(int(std::lround((v - row.p.minimum) / step)));
+                    }
+                    // The default comes from a float (2.4 reads back as 2.4000000954), so
+                    // compare with a tolerance or "back to default" would still be saved.
+                    if (qAbs(v - row.p.initial) <= 1e-5 + 1e-6 * qAbs(row.p.initial))
+                        current.remove(row.p.name);
+                    else
+                        current.insert(row.p.name, v);
+                    showChanged(row);
+                    if (shaderPreview)
+                        shaderPreview->setParameterValue(row.p.name, v);
+                });
+            connect(row.slider, &QSlider::valueChanged, &dlg, [row, step](int i) {
+                row.spin->setValue(qMin(row.p.maximum, row.p.minimum + i * step));
+            });
+            connect(row.reset, &QPushButton::clicked, &dlg, [row]() { row.spin->setValue(row.p.initial); });
+        }
+        connect(resetAll, &QPushButton::clicked, &dlg, [rows]() {
+            for (const Row &row : rows)
+                row.spin->setValue(row.p.initial);
+        });
+        connect(filter, &QLineEdit::textChanged, &dlg, [rows](const QString &text) {
+            for (const Row &row : rows) {
+                const bool show = text.trimmed().isEmpty() || row.haystack.contains(text.trimmed(), Qt::CaseInsensitive);
+                row.label->setVisible(show);
+                row.slider->setVisible(show);
+                row.spin->setVisible(show);
+                row.reset->setVisible(show);
+            }
+        });
+
+        QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        root->addWidget(bb);
+        dlg.resize(640, 560);
+        // Sit beside the main window, not over the preview it is changing.
+        if (QScreen *scr = screen()) {
+            const QRect avail = scr->availableGeometry();
+            const QRect mine = frameGeometry();
+            if (mine.right() + 12 + dlg.width() <= avail.right())
+                dlg.move(mine.right() + 12, mine.top());
+        }
+
+        if (dlg.exec() == QDialog::Accepted) {
+            shaderParams = FormatParams(current);
+        } else {
+            for (const ShaderParam &p : list) // undo what the live preview showed
+                if (shaderPreview)
+                    shaderPreview->setParameterValue(p.name, original.contains(p.name) ? original.value(p.name) : p.initial);
+        }
+        if (shaderPreview)
+            shaderPreview->setParameters(ParseParams(shaderParams));
+        updateParamsButton();
+    }
+
+    // ----- downloading the slang shader collection -----
+
+    // Fetches libretro/slang-shaders into shadersHome(). The address can be
+    // overridden (AGSSETUP_SHADERS_URL) to point at a mirror or an offline copy.
+    void downloadShaders() {
+        const QString dest = shadersHome();
+        const QString urlText = qEnvironmentVariable("AGSSETUP_SHADERS_URL",
+            "https://codeload.github.com/libretro/slang-shaders/tar.gz/refs/heads/master");
+        const bool exists = QFileInfo(dest).isDir();
+        if (QMessageBox::question(this, "Get shaders",
+                "Download the RetroArch slang shader collection (libretro/slang-shaders) to:\n" + dest +
+                (exists ? "\n\nThe copy already there is replaced." : QString()) +
+                "\n\nIt is a large download (tens of megabytes). Continue?") != QMessageBox::Yes)
+            return;
+        if (!QDir().mkpath(QFileInfo(dest).path())) {
+            QMessageBox::critical(this, "Get shaders", "Could not create:\n" + QFileInfo(dest).path());
+            return;
+        }
+
+        const QString archive = dest + ".download.tar.gz";
+        const QString staging = dest + ".new";
+        QDir(staging).removeRecursively();
+        QFile file(archive);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            QMessageBox::critical(this, "Get shaders", "Could not write:\n" + archive);
+            return;
+        }
+
+        QNetworkAccessManager net;
+        QNetworkRequest req{QUrl(urlText)};
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        req.setHeader(QNetworkRequest::UserAgentHeader, "agssetup");
+        QNetworkReply *reply = net.get(req);
+
+        QProgressDialog wait("Downloading shaders...", "Cancel", 0, 0, this);
+        wait.setWindowModality(Qt::WindowModal);
+        wait.setMinimumDuration(0);
+        wait.setAutoClose(false);
+        wait.setAutoReset(false);
+
+        QEventLoop loop;
+        bool cancelled = false;
+        QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() { file.write(reply->readAll()); });
+        QObject::connect(reply, &QNetworkReply::downloadProgress, &loop, [&](qint64 got, qint64 total) {
+            if (total > 0) {
+                wait.setMaximum(int(total / 1024));
+                wait.setValue(int(got / 1024));
+            }
+            wait.setLabelText(QString("Downloading shaders... %1 MB").arg(got / (1024.0 * 1024.0), 0, 'f', 1));
+        });
+        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        QObject::connect(&wait, &QProgressDialog::canceled, &loop, [&]() { cancelled = true; loop.quit(); });
+        wait.show();
+        loop.exec();
+
+        QString problem;
+        if (cancelled) {
+            reply->abort();
+            problem = "cancelled";
+        } else {
+            file.write(reply->readAll());
+            if (reply->error() != QNetworkReply::NoError)
+                problem = reply->errorString();
+        }
+        reply->deleteLater();
+        file.close();
+        if (!problem.isEmpty()) {
+            QFile::remove(archive);
+            if (!cancelled)
+                QMessageBox::critical(this, "Get shaders", "The download failed: " + problem);
+            return;
+        }
+
+        wait.setLabelText("Unpacking...");
+        wait.setRange(0, 0);
+        QDir().mkpath(staging);
+        QProcess tar;
+        tar.setProcessChannelMode(QProcess::MergedChannels);
+        QEventLoop untar;
+        QObject::connect(&tar, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), &untar, &QEventLoop::quit);
+        QObject::connect(&tar, &QProcess::errorOccurred, &untar, &QEventLoop::quit);
+        QObject::connect(&wait, &QProgressDialog::canceled, &untar, [&]() { cancelled = true; untar.quit(); });
+        QTimer limit;
+        limit.setSingleShot(true);
+        QObject::connect(&limit, &QTimer::timeout, &untar, &QEventLoop::quit);
+        tar.start("tar", {"-xzf", archive, "-C", staging, "--strip-components=1", "--no-same-owner"});
+        if (tar.waitForStarted(5000)) {
+            limit.start(180000);
+            untar.exec();
+        }
+        const bool finishedOk = tar.state() == QProcess::NotRunning && tar.exitStatus() == QProcess::NormalExit &&
+                                tar.exitCode() == 0;
+        if (tar.state() != QProcess::NotRunning) {
+            tar.kill();
+            tar.waitForFinished(2000);
+        }
+        QFile::remove(archive);
+        if (cancelled) {
+            QDir(staging).removeRecursively();
+            return;
+        }
+        bool hasPresets = false;
+        if (finishedOk) {
+            QDirIterator it(staging, {"*.slangp"}, QDir::Files, QDirIterator::Subdirectories);
+            hasPresets = it.hasNext();
+        }
+        if (!finishedOk || !hasPresets) {
+            const QString why = !finishedOk
+                ? "Could not unpack the download (is 'tar' installed?)\n" + QString::fromLocal8Bit(tar.readAll()).left(400)
+                : QString("The download contains no .slangp presets.");
+            QDir(staging).removeRecursively();
+            QMessageBox::critical(this, "Get shaders", why);
+            return;
+        }
+        // Swap the new copy in only now that it is known to be good.
+        const QString old = dest + ".old";
+        QDir(old).removeRecursively();
+        if (QFileInfo(dest).isDir() && !QDir().rename(dest, old)) {
+            QDir(staging).removeRecursively();
+            QMessageBox::critical(this, "Get shaders", "Could not replace:\n" + dest);
+            return;
+        }
+        if (!QDir().rename(staging, dest)) {
+            if (QFileInfo(old).isDir())
+                QDir().rename(old, dest); // put the previous copy back
+            QMessageBox::critical(this, "Get shaders", "Could not install into:\n" + dest);
+            return;
+        }
+        QDir(old).removeRecursively();
+        lastShaderDir = dest;
+        QMessageBox::information(this, "Get shaders",
+            "Shaders installed in:\n" + dest + "\n\nUse Browse... to pick a preset (for example "
+            "crt/crt-royale.slangp).");
     }
 
     // ----- settings profiles: export/import to an arbitrary file, or save/apply
@@ -2420,6 +3148,10 @@ private:
             env.insert("AGS_LIBRASHADER_PRESET", preset);
         else
             env.remove("AGS_LIBRASHADER_PRESET");
+        if (withShader && !preset.isEmpty() && !shaderParams.isEmpty())
+            env.insert("AGS_LIBRASHADER_PARAMS", shaderParams);
+        else
+            env.remove("AGS_LIBRASHADER_PARAMS");
         const QString extra = extraEnv->text().trimmed();
         if (!extra.isEmpty()) {
             for (const QString &item : QProcess::splitCommand(extra)) {

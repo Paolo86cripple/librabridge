@@ -15,6 +15,11 @@
 
 #include "debug/out.h"
 
+#include <cstdlib>
+#include <locale>
+#include <sstream>
+#include <string>
+
 namespace AGS
 {
 namespace Engine
@@ -76,6 +81,49 @@ static uint16_t DetectGlslVersion(GLProcLoader loader)
     return static_cast<uint16_t>(major * 100 + minor * 10);
 }
 
+// Parameter overrides chosen in the launcher (agssetup), passed as
+// AGS_LIBRASHADER_PARAMS="NAME=value;NAME2=value". Names a preset does not have
+// are ignored (librashader reports them as errors; that is not fatal).
+static void ApplyEnvParameters(const libra_instance_t &libra, libra_gl_filter_chain_t chain)
+{
+    const char *env = std::getenv("AGS_LIBRASHADER_PARAMS");
+    if (!env || !*env)
+        return;
+    const std::string spec(env);
+    int applied = 0, ignored = 0;
+    size_t pos = 0;
+    while (pos < spec.size())
+    {
+        size_t end = spec.find(';', pos);
+        if (end == std::string::npos)
+            end = spec.size();
+        const std::string item = spec.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0)
+            continue;
+        const std::string name = item.substr(0, eq);
+        // Locale-independent: the game may have set a locale with a decimal comma.
+        std::istringstream value_text(item.substr(eq + 1));
+        value_text.imbue(std::locale::classic());
+        float value = 0.f;
+        if (!(value_text >> value))
+            continue;
+        libra_error_t err = libra.gl_filter_chain_set_param(&chain, name.c_str(), value);
+        if (err != nullptr)
+        {
+            libra.error_free(&err);
+            ++ignored;
+        }
+        else
+        {
+            ++applied;
+        }
+    }
+    Debug::Printf(kDbgMsg_Info, "librashader: %d shader parameter(s) set, %d not in this preset",
+        applied, ignored);
+}
+
 bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
 {
     Shutdown();
@@ -115,6 +163,7 @@ bool LibrashaderGL::Init(const std::string &preset_path, GLProcLoader loader)
         return false;
     }
 
+    ApplyEnvParameters(libra, chain);
     _chain = chain;
     Debug::Printf(kDbgMsg_Info, "librashader: loaded preset '%s' (GLSL %u)",
         preset_path.c_str(), static_cast<unsigned>(opts.glsl_version));

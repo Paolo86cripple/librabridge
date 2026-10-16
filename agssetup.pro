@@ -1,5 +1,5 @@
 TARGET = agssetup
-QT += widgets openglwidgets
+QT += widgets openglwidgets network
 CONFIG += c++17
 
 SOURCES += agssetup.cpp

@@ -240,7 +240,13 @@ insieme nella stessa cartella.
    chiesto se salvarle. **Remove** (o il menu del tasto destro) toglie il gioco
    selezionato dalla libreria cancellando le sue impostazioni salvate qui — mai
    i file del gioco — e *Remove all other games...* toglie tutti tranne quello
-   aperto.
+   aperto. Un gioco "(missing)" si può sempre selezionare e rimuovere.
+
+   Se un gioco è stato **spostato** (o il disco ha un altro punto di mount),
+   selezionalo e premi **Locate missing game...** (oppure usa il menu del tasto
+   destro): indichi dove si trova ora, e le sue impostazioni — shader, parametri,
+   opzioni grafiche — lo seguono, insieme all'ultimo log. Se la nuova posizione è
+   già in libreria con impostazioni proprie, viene chiesto se sostituirle.
 3. Regola le opzioni nelle schede, poi **Save && Play**.
 
 Le schede coprono tutto ciò che offre winsetup.exe e altro:
@@ -256,6 +262,27 @@ Le schede coprono tutto ciò che offre winsetup.exe e altro:
   mostra l'errore vero e proprio di librashader. Su una sessione senza OpenGL
   (rarissimo su un desktop reale) la preview si disattiva da sola con un
   messaggio, invece di piantarsi.
+
+  Intorno al preset:
+  - **Get shaders...** scarica la raccolta `libretro/slang-shaders` in
+    `~/.local/share/agssetup/slang-shaders` (con una barra di avanzamento
+    annullabile; la copia nuova sostituisce quella vecchia solo se è integra, e un
+    download fallito lascia intatta quella che c'era). Da quel momento i dialoghi
+    di scelta del preset si aprono lì. L'indirizzo si può cambiare con la
+    variabile `AGSSETUP_SHADERS_URL` (un mirror, o una copia locale servita in
+    http); serve il comando `tar`.
+  - **Shader parameters...** apre un editor con un cursore per ogni
+    `#pragma parameter` del preset (scanline, curvatura, luminosità...), con
+    filtro, *Reset* per riga e *Reset all*. L'anteprima si aggiorna mentre muovi i
+    cursori. I valori diversi dal default sono salvati **per gioco**
+    (`[librabridge] shader_params`) e il motore li applica all'avvio tramite
+    `AGS_LIBRASHADER_PARAMS` (`NOME=valore;NOME2=valore`; un nome che il preset non
+    ha viene ignorato). Cambiando preset i parametri tornano ai default, perché
+    appartengono a quel preset.
+  - **Preview image...** fa girare il preset su una schermata del tuo gioco
+    invece del pattern di prova (qualunque immagine che Qt sappia leggere; viene
+    ricordata per gioco). L'immagine è mostrata con le sue proporzioni, come fa il
+    motore con una finestra. **Use test pattern** torna al pattern.
 - **Audio** — suono, driver, voice pack, cache dei suoni e soglia di
   caricamento.
 - **Controls** — mouse (blocco automatico, velocità, quando il motore ne
@@ -303,6 +330,23 @@ motore legge solo il file per-gioco (`--conf`). Nella stessa cartella,
 `<nome>-<hash>.log` contiene l'output dell'ultimo avvio del motore.
 
 Per compilare solo la GUI: `make` (qmake6, in `build/`) oppure `make cmake`.
+Servono Qt6 con i moduli Widgets, OpenGLWidgets e Network.
+
+### Test della GUI
+
+`tests/run.sh` compila e lancia i test di `agssetup` (libreria, *Locate*, parametri
+shader, download con un server HTTP locale, rendering reale dell'anteprima):
+
+    tests/run.sh                                  # offscreen, senza la parte OpenGL
+    xvfb-run -a tests/run.sh                      # con display: l'anteprima viene disegnata davvero
+    LIBRASHADER_SO=/percorso/librashader.so tests/run.sh   # + catena di filtri e elenco parametri
+    SANITIZE=1 tests/run.sh                       # AddressSanitizer + UBSan
+
+I test sono compilati da una *copia* di `agssetup.cpp` con in coda `tests/cases.inc`
+(le classi stanno dentro quel file, e `-fno-access-control` permette ai test di
+usare i membri privati senza toccare il sorgente che viene distribuito). La CI li
+esegue a ogni build, sotto Xvfb con OpenGL software e con la `librashader.so`
+appena compilata.
 
 ## Prossimi passi ragionevoli
 

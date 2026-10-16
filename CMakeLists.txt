@@ -9,12 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 # Find Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets Network)
 
 # Target
 add_executable(agssetup agssetup.cpp)
 
-target_link_libraries(agssetup PRIVATE Qt6::Widgets Qt6::OpenGLWidgets)
+target_link_libraries(agssetup PRIVATE Qt6::Widgets Qt6::OpenGLWidgets Qt6::Network)
 
 # Install (optional)
 # install(TARGETS agssetup DESTINATION bin)

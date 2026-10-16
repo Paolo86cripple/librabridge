@@ -166,6 +166,16 @@ jobs:
           qmake6 agssetup.pro
           make -j$(nproc)
 
+      # Offscreen for the logic, Xvfb + software OpenGL for the shader preview, with
+      # the librashader.so built above: this is where "Locate", the shader
+      # parameters and the downloader are exercised for real (tests/run.sh).
+      - name: Test agssetup GUI
+        run: |
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri
+          export LIBRASHADER_SO="$PWD/librashader/target/release/liblibrashader_capi.so"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x800x24" env QT_QPA_PLATFORM=xcb librabridge/tests/run.sh
+
       - name: Collect artifacts
         run: |
           pkg=pkg/ags-librashader
