@@ -3,9 +3,14 @@ name: Build AGS + librashader (Linux x86_64)
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    # v1.2.0 and 1.2.0 both count as a version tag
+    tags: [ 'v*', '[0-9]*' ]
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'Tag of an EXISTING GitHub release (e.g. 1.2.0): builds stable and canary from that tag and attaches the tarballs to it'
+        required: false
+        default: ''
       ags_ref:
         description: 'adventuregamestudio/ags branch, tag or commit to build (empty = the pinned revision)'
         required: false
@@ -38,12 +43,15 @@ jobs:
       - id: set
         # Which variant(s) to build this run:
         #   schedule (nightly)      -> canary only
-        #   a version tag (v*)      -> stable AND canary, so a release carries both
+        #   a version tag           -> stable AND canary, so a release carries both
+        #   manual with release_tag -> stable AND canary, attached to that release
         #   push to main / manual   -> stable only
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             matrix='["canary"]'
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          elif [[ "${{ github.ref }}" == refs/tags/* || -n "$RELEASE_TAG" ]]; then
             matrix='["stable","canary"]'
           else
             matrix='["stable"]'
@@ -86,6 +94,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: librabridge
+          # a manual run for an existing release packages exactly that tag
+          # (empty = the commit that triggered the run)
+          ref: ${{ github.event.inputs.release_tag }}
 
       - name: Checkout AGS
         uses: actions/checkout@v4
@@ -206,7 +217,7 @@ jobs:
     # succeeded (always()): a broken canary must not block shipping a good
     # stable build under the same tag. Whichever tarball(s) actually got
     # uploaded are the ones published.
-    if: always() && startsWith(github.ref, 'refs/tags/')
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event.inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -223,7 +234,8 @@ jobs:
           ls -la out
           [ -n "$(ls -A out)" ] || { echo "::error::No build succeeded for this tag - nothing to release"; exit 1; }
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (tag push)
+        if: github.event.inputs.release_tag == ''
         uses: softprops/action-gh-release@v2
         with:
           files: out/*.tar.gz
@@ -243,3 +255,12 @@ jobs:
             `agssetup` needs Qt 6 on the system (Widgets, OpenGLWidgets and Network modules;
             e.g. `qt6-base` on Arch, `libqt6widgets6 libqt6openglwidgets6 libqt6network6` on
             Debian/Ubuntu). Keep `ags`, `librashader.so` and `agssetup` in the same folder.
+
+      # A release that was written by hand (its notes are the author's) only needs
+      # the packages: its text and title are left exactly as they are.
+      - name: Attach the tarballs to the existing release (manual run)
+        if: github.event.inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: out/*.tar.gz
