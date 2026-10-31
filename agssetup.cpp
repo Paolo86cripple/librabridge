@@ -90,10 +90,15 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QUrl>
+#include <QDateTime>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QDirIterator>
 #include <QImageReader>
 #include <QGridLayout>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <vector>
 #include <cstring>
@@ -130,6 +135,7 @@ const char *PREFS_LAST_SHADER_DIR = "Preferences/LastShaderDirectory";
 const char *PREFS_WINDOW_GEOMETRY = "Preferences/MainWindowGeometryV2";
 const char *PREFS_CLOSE_ON_PLAY = "Preferences/CloseOnPlay";
 const char *PREFS_SPLITTER = "Preferences/SplitterState";
+const char *PREFS_LIBRARY_SORT = "Preferences/LibrarySort";
 
 // ---------------------------------------------------------------------------
 // Minimal INI model. QSettings is deliberately not used for the engine config:
@@ -351,12 +357,17 @@ struct GameEntry {
     QString path;    // game folder or data file, as it was selected
     QString cfgFile; // the settings file that records it (kept so a game whose
                      // folder is gone, e.g. an unmounted drive, can still be removed)
+    bool favorite = false;
+    qint64 lastPlayed = 0; // seconds since the epoch; 0 = never started from here
+    int launches = 0;
 };
+
+enum LibrarySort { SortByName = 0, SortByRecent = 1 };
 
 // Every game with saved settings: the game_path recorded in each *.cfg under
 // configDir(), sorted by name. This list IS the games library - a game is in it
 // from the moment it is first opened here.
-QVector<GameEntry> configuredGames(int maxCount) {
+QVector<GameEntry> configuredGames(int maxCount, int sortMode = SortByName) {
     QVector<GameEntry> out;
     const QFileInfoList files = QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files);
     for (const QFileInfo &fi : files) {
@@ -372,15 +383,72 @@ QVector<GameEntry> configuredGames(int maxCount) {
         QString name = gi.isDir() ? gi.fileName() : gi.completeBaseName();
         if (name.isEmpty())
             name = path;
-        out.append({name, path, fi.absoluteFilePath()});
+        GameEntry g{name, path, fi.absoluteFilePath()};
+        g.favorite = cfg.value("librabridge", "favorite").trimmed() == "1";
+        g.lastPlayed = cfg.value("librabridge", "last_played").trimmed().toLongLong();
+        g.launches = cfg.value("librabridge", "launches").trimmed().toInt();
+        out.append(g);
     }
-    std::sort(out.begin(), out.end(), [](const GameEntry &a, const GameEntry &b) {
+    // Favourites first in every order; then by name, or most recently started first
+    // (games never started here last, by name).
+    std::sort(out.begin(), out.end(), [sortMode](const GameEntry &a, const GameEntry &b) {
+        if (a.favorite != b.favorite)
+            return a.favorite;
+        if (sortMode == SortByRecent && a.lastPlayed != b.lastPlayed)
+            return a.lastPlayed > b.lastPlayed;
         const int c = a.name.compare(b.name, Qt::CaseInsensitive);
         return c != 0 ? c < 0 : a.path < b.path;
     });
     if (out.size() > maxCount)
-        out.resize(maxCount); // the first ones by name, not whichever the disk listed first
+        out.resize(maxCount); // the first ones in the chosen order, not whichever the disk listed first
     return out;
+}
+
+// ---- desktop shortcuts ----------------------------------------------------
+// A launcher entry that starts one game straight away: "agssetup --play <game>".
+
+// One argument as the Desktop Entry spec wants it in Exec=: double-quoted when it
+// has anything special, with " ` $ \ escaped, and '%' doubled (it is a field code).
+QString DesktopExecArg(const QString &arg) {
+    QString out = arg;
+    out.replace('%', "%%");
+    static const QString special = QStringLiteral(" \t\n\"'\\><~|&;$*?#()`");
+    bool quote = out.isEmpty();
+    for (const QChar c : out)
+        quote = quote || special.contains(c);
+    if (!quote)
+        return out;
+    QString q;
+    for (const QChar c : out) {
+        if (c == '"' || c == '`' || c == '$' || c == '\\')
+            q += '\\';
+        q += c;
+    }
+    return '"' + q + '"';
+}
+
+// The text of the .desktop file. The backslashes of the quoting rule are
+// themselves escaped once more, as the spec says for string values.
+QString DesktopEntryText(const QString &name, const QString &exePath, const QString &gamePath) {
+    QString exec = DesktopExecArg(exePath) + " --play " + DesktopExecArg(gamePath);
+    exec.replace("\\", "\\\\");
+    QString title = name;
+    title.replace(QRegularExpression("[\\r\\n]+"), " ");
+    return "[Desktop Entry]\n"
+           "Type=Application\n"
+           "Version=1.0\n"
+           "Name=" + title.trimmed() + "\n"
+           "Comment=Play with AGS and librashader shaders\n"
+           "Exec=" + exec + "\n"
+           "Icon=applications-games\n"
+           "Terminal=false\n"
+           "Categories=Game;AdventureGame;\n"
+           "StartupNotify=false\n";
+}
+
+QString DesktopShortcutPath(const QString &gameKeyText) {
+    return QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation) +
+           "/agssetup-" + gameKeyText + ".desktop";
 }
 
 // What a folder scan found. A scan looks in the folder itself and up to two
@@ -1079,6 +1147,11 @@ public:
         resize(1060, 740); // wide enough for the 640 px preview; short enough for a 768 px screen
         loadPreferences();
         buildUI();
+        // Files and folders dropped anywhere on the window add or open games. Text
+        // fields would swallow a dropped path as text, so they must not take drops.
+        setAcceptDrops(true);
+        for (QLineEdit *edit : findChildren<QLineEdit *>())
+            edit->setAcceptDrops(false);
 
         if (!windowGeometry.isEmpty())
             restoreGeometry(windowGeometry);
@@ -1120,6 +1193,7 @@ private:
     QByteArray windowGeometry;
     bool closeOnPlay = true;
     QByteArray splitterState;
+    int librarySortMode = SortByName;
 
     // Current game
     QString currentGame; // normalized path of the selected game; empty = none/invalid
@@ -1140,6 +1214,7 @@ private:
     QSplitter *splitter = nullptr;
     QListWidget *libraryList = nullptr;
     QLineEdit *libraryFilter = nullptr;
+    QComboBox *librarySort = nullptr;
     QPushButton *libraryRemoveBtn = nullptr;
     bool updatingLibrary = false; // true while the list is rebuilt/synced from code
     QString libraryFocus;         // entry the user picked that could not be opened (e.g. missing files)
@@ -1226,6 +1301,8 @@ private:
         windowGeometry = prefs.value(PREFS_WINDOW_GEOMETRY).toByteArray();
         closeOnPlay = prefs.value(PREFS_CLOSE_ON_PLAY, true).toBool();
         splitterState = prefs.value(PREFS_SPLITTER).toByteArray();
+        librarySortMode = prefs.value(PREFS_LIBRARY_SORT, int(SortByName)).toInt() == SortByRecent ? SortByRecent
+                                                                                                 : SortByName;
     }
 
     void savePreferences() {
@@ -1241,6 +1318,7 @@ private:
             prefs.setValue(PREFS_SPLITTER, splitter->saveState());
         if (closeOnPlayBox)
             prefs.setValue(PREFS_CLOSE_ON_PLAY, closeOnPlayBox->isChecked());
+        prefs.setValue(PREFS_LIBRARY_SORT, librarySortMode);
     }
 
     // ----- option bindings (see struct Binding) -----
@@ -1939,6 +2017,7 @@ private:
             profileMenu->addAction("Import settings from file...", this, &AGSSetup::importSettings);
             profileMenu->addSeparator();
             profileMenu->addAction("Save current settings as profile...", this, &AGSSetup::saveAsProfile);
+            profileMenu->addAction("Apply a profile to all games...", this, &AGSSetup::applyProfileToAllGamesDialog);
             const QStringList names = listProfiles();
             if (names.isEmpty()) {
                 profileMenu->addAction("(no saved profiles yet)")->setEnabled(false);
@@ -2142,6 +2221,18 @@ private:
         connect(libraryFilter, &QLineEdit::textChanged, this, &AGSSetup::applyLibraryFilter);
         l->addWidget(libraryFilter);
 
+        librarySort = new QComboBox(panel);
+        librarySort->addItem("Sort: name", int(SortByName));
+        librarySort->addItem("Sort: recently played", int(SortByRecent));
+        librarySort->setToolTip("Favourites (marked with a star) always come first.\n"
+                                "\"Recently played\" puts the games you started last at the top.");
+        librarySort->setCurrentIndex(librarySortMode == SortByRecent ? 1 : 0);
+        connect(librarySort, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            librarySortMode = librarySort->currentData().toInt();
+            refreshLibrary();
+        });
+        l->addWidget(librarySort);
+
         libraryList = new QListWidget(panel);
         libraryList->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(libraryList, &QListWidget::itemClicked, this, &AGSSetup::onLibraryItemChosen);
@@ -2205,13 +2296,13 @@ private:
             return;
         updatingLibrary = true;
         libraryList->clear();
-        const QVector<GameEntry> games = configuredGames(500);
+        const QVector<GameEntry> games = configuredGames(500, librarySortMode);
         QHash<QString, int> sameName;
         for (const GameEntry &g : games)
             sameName[g.name.toLower()]++;
         for (const GameEntry &g : games) {
             const QFileInfo gi(g.path);
-            QString label = g.name;
+            QString label = (g.favorite ? QString::fromUtf8("\u2605 ") : QString()) + g.name;
             if (sameName.value(g.name.toLower()) > 1) {
                 // two games with the same name: tell them apart by where they live
                 const QDir holder = gi.isDir() ? gi.dir() : QFileInfo(gi.absolutePath()).dir();
@@ -2221,6 +2312,7 @@ private:
             item->setData(Qt::UserRole, g.path);
             item->setData(Qt::UserRole + 1, g.cfgFile);
             item->setData(Qt::UserRole + 2, label); // without the "(missing)" mark
+            item->setData(Qt::UserRole + 3, playInfo(g));
             markMissing(item, !gi.exists());
         }
         updatingLibrary = false;
@@ -2228,12 +2320,22 @@ private:
         syncLibrarySelection();
     }
 
+    // "Last played ..." for the tooltip, empty for a game never started from here.
+    static QString playInfo(const GameEntry &g) {
+        if (g.lastPlayed <= 0)
+            return QString();
+        return "Last played: " + QDateTime::fromSecsSinceEpoch(g.lastPlayed).toString("yyyy-MM-dd HH:mm") +
+               QString(" (started %1 time(s) from here)").arg(qMax(1, g.launches));
+    }
+
     // Shows (or clears) the "(missing)" state of an entry.
     void markMissing(QListWidgetItem *item, bool missing) {
         const QString base = item->data(Qt::UserRole + 2).toString();
         const QString path = item->data(Qt::UserRole).toString();
         item->setText(missing ? base + "  (missing)" : base);
-        item->setToolTip(missing ? path + "\nNot found - is its drive mounted?" : path);
+        const QString info = item->data(Qt::UserRole + 3).toString();
+        item->setToolTip((missing ? path + "\nNot found - is its drive mounted?" : path) +
+                         (info.isEmpty() ? QString() : "\n" + info));
         item->setForeground(missing ? QBrush(palette().color(QPalette::Disabled, QPalette::Text)) : QBrush());
     }
 
@@ -2456,17 +2558,83 @@ private:
         const bool missing = libraryItemMissing(item);
         QAction *locateFile = missing ? menu.addAction("Locate game data file...") : nullptr;
         QAction *locateFolder = missing ? menu.addAction("Locate game folder...") : nullptr;
+        const QString cfgFile = item ? item->data(Qt::UserRole + 1).toString() : QString();
+        const bool isFavorite = item && item->text().startsWith(QString::fromUtf8("\u2605"));
+        QAction *favorite = item ? menu.addAction(isFavorite ? "Remove from favourites" : "Add to favourites") : nullptr;
+        const bool hasShortcut = item && QFileInfo::exists(DesktopShortcutPath(QFileInfo(cfgFile).completeBaseName()));
+        QAction *shortcut = item ? menu.addAction(hasShortcut ? "Update the desktop shortcut"
+                                                              : "Create a desktop shortcut") : nullptr;
+        QAction *noShortcut = hasShortcut ? menu.addAction("Remove the desktop shortcut") : nullptr;
+        menu.addSeparator();
         QAction *removeThis = item ? menu.addAction("Remove from library...") : nullptr;
         QAction *removeOthers = menu.addAction("Remove all other games...");
+        menu.addSeparator();
+        QAction *profileAll = menu.addAction("Apply a profile to all games...");
         QAction *chosen = menu.exec(libraryList->viewport()->mapToGlobal(pos));
         if (!chosen)
             return;
         if (chosen == locateFile || chosen == locateFolder)
             relocateLibraryGame(item, chosen == locateFolder);
+        else if (chosen == favorite)
+            setFavorite(cfgFile, !isFavorite);
+        else if (chosen == shortcut)
+            createDesktopShortcut(item);
+        else if (chosen == noShortcut)
+            QFile::remove(DesktopShortcutPath(QFileInfo(cfgFile).completeBaseName()));
         else if (chosen == removeThis)
             removeLibraryGame(item);
         else if (chosen == removeOthers)
             removeAllOtherGames();
+        else if (chosen == profileAll)
+            applyProfileToAllGamesDialog();
+    }
+
+    // Changes one game's settings file from outside its widgets. When that game is
+    // the open one, the in-memory copy (what the next Save writes out) gets the
+    // same change, or Save would quietly undo it.
+    void updateGameCfg(const QString &cfgFile, const std::function<void(IniFile &)> &change) {
+        IniFile file;
+        if (file.load(cfgFile)) {
+            change(file);
+            file.save(cfgFile);
+        }
+        if (!cfgPath.isEmpty() && cfgFile == cfgPath)
+            change(ini);
+    }
+
+    void setFavorite(const QString &cfgFile, bool on) {
+        updateGameCfg(cfgFile, [on](IniFile &f) {
+            if (on)
+                f.setValue("librabridge", "favorite", "1");
+            else
+                f.removeValue("librabridge", "favorite");
+        });
+        refreshLibrary();
+    }
+
+    // The settings file's own name is the game's key, so the shortcut is named after it.
+    void createDesktopShortcut(const QListWidgetItem *item) {
+        const QString game = item->data(Qt::UserRole).toString();
+        const QString cfgFile = item->data(Qt::UserRole + 1).toString();
+        const QString target = DesktopShortcutPath(QFileInfo(cfgFile).completeBaseName());
+        if (!QDir().mkpath(QFileInfo(target).path())) {
+            QMessageBox::critical(this, "Desktop shortcut", "Could not create:\n" + QFileInfo(target).path());
+            return;
+        }
+        QString name = item->text();
+        name.remove(QString::fromUtf8("\u2605 "));
+        name.remove("  (missing)");
+        QSaveFile f(target);
+        if (!f.open(QIODevice::WriteOnly) ||
+            f.write(DesktopEntryText(name, QCoreApplication::applicationFilePath(), game).toUtf8()) < 0 ||
+            !f.commit()) {
+            QMessageBox::critical(this, "Desktop shortcut", "Could not write:\n" + target);
+            return;
+        }
+        QFile(target).setPermissions(QFile(target).permissions() | QFileDevice::ExeOwner);
+        QMessageBox::information(this, "Desktop shortcut",
+            "Created:\n" + target + "\n\nIt appears in the applications menu and starts the game directly, "
+            "with the settings saved here.");
     }
 
     // Translations are the .tra files that sit in the game's folder.
@@ -2713,6 +2881,7 @@ private:
             base.chop(4); // strip ".cfg"
             QFile::remove(base + ".log");
             QFile::remove(base + ".preview.cfg");
+            QFile::remove(DesktopShortcutPath(QFileInfo(base).fileName())); // its launcher goes with it
         }
     }
 
@@ -3173,10 +3342,73 @@ private:
     // Copies only the keys PRESENT in `from` into `ini` (so a profile that
     // predates a newer option, or one that was deliberately trimmed down, does
     // not clobber options it says nothing about), then reloads the widgets.
-    void applyProfileFile(const IniFile &from, const QString &statusLine) {
-        for (const Binding &b : bindings)
+    // Copies a profile's keys into one game's settings. The preset and its parameters
+    // belong together: a profile that sets a preset but has no parameters means "the
+    // preset's defaults", so the game's old parameters (for another preset) go.
+    // `preview_image` is a picture of one particular game and never travels.
+    void applyProfileKeys(const IniFile &from, IniFile &to, bool withPreviewImage) const {
+        for (const Binding &b : bindings) {
+            if (!withPreviewImage && b.key == "preview_image")
+                continue;
             if (from.contains(b.section, b.key))
-                ini.setValue(b.section, b.key, from.value(b.section, b.key));
+                to.setValue(b.section, b.key, from.value(b.section, b.key));
+        }
+        if (from.contains("librabridge", "shader_preset") && !from.contains("librabridge", "shader_params"))
+            to.removeValue("librabridge", "shader_params");
+    }
+
+    // Every game in the library gets the profile's options. Returns how many.
+    int applyProfileToAllGames(const IniFile &profile) {
+        int count = 0;
+        for (const QFileInfo &fi : QDir(configDir()).entryInfoList({"*.cfg"}, QDir::Files)) {
+            if (fi.fileName().endsWith(".preview.cfg"))
+                continue;
+            IniFile game;
+            if (!game.load(fi.absoluteFilePath()) || !game.contains("librabridge", "game_path"))
+                continue;
+            applyProfileKeys(profile, game, false);
+            count += game.save(fi.absoluteFilePath());
+        }
+        return count;
+    }
+
+    void applyProfileToAllGamesDialog() {
+        const QStringList names = listProfiles();
+        if (names.isEmpty()) {
+            QMessageBox::information(this, "No profiles",
+                "There are no saved profiles yet. Open a game, set it up the way you want, and use\n"
+                "Profile > Save current settings as profile...");
+            return;
+        }
+        bool ok = false;
+        const QString name = QInputDialog::getItem(this, "Apply a profile to all games", "Profile:", names, 0, false, &ok);
+        if (!ok || name.isEmpty())
+            return;
+        IniFile profile;
+        if (!profile.load(QDir(profilesDir()).filePath(name + ".cfg"))) {
+            QMessageBox::warning(this, "Profile not found", "Could not read the profile \"" + name + "\".");
+            return;
+        }
+        const int total = configuredGames(100000).size();
+        if (QMessageBox::question(this, "Apply a profile to all games",
+                QString("Apply profile \"%1\" to all %2 game(s) in the library?\n\n"
+                        "The options it sets are overwritten in each game's saved settings; options it "
+                        "does not mention stay as they are.").arg(name).arg(total)) != QMessageBox::Yes)
+            return;
+        // The open game is rewritten like the others, so its own unsaved edits are settled first.
+        const bool reopen = !currentGame.isEmpty();
+        if (reopen && !confirmLeaveCurrentGame())
+            return;
+        const int done = applyProfileToAllGames(profile);
+        refreshLibrary();
+        if (reopen)
+            selectGame(currentGame); // show what is on disk now
+        QMessageBox::information(this, "Apply a profile to all games",
+            QString("Profile \"%1\" applied to %2 game(s).").arg(name).arg(done));
+    }
+
+    void applyProfileFile(const IniFile &from, const QString &statusLine) {
+        applyProfileKeys(from, ini, true);
         normalizeLegacyValues();
         populateWidgets();
         gameStatus->setText(statusLine + "\nNot saved yet.");
@@ -3385,9 +3617,35 @@ private:
                                   "Could not start the engine:\n" + engine + "\n\n" + proc.errorString());
             return false;
         }
+        recordLaunch();
         return true;
     }
 
+    // When the game was last started from here, and how often: shown in the library
+    // and used by "Sort: recently played". Written to the settings file at once - the
+    // in-memory copy gets it too, so the next Save keeps it.
+    void recordLaunch() {
+        const QString now = QString::number(QDateTime::currentSecsSinceEpoch());
+        const int count = ini.value("librabridge", "launches").trimmed().toInt() + 1;
+        ini.setValue("librabridge", "last_played", now);
+        ini.setValue("librabridge", "launches", QString::number(count));
+        ini.save(cfgPath);
+        refreshLibrary();
+    }
+
+public:
+    // "agssetup --play <game>": no window, just the saved settings and the engine.
+    // Meant for shortcuts and launchers. 0 = started.
+    int playFromCommandLine() {
+        if (currentGame.isEmpty()) {
+            QMessageBox::warning(this, "Game not found", gameStatus->text().isEmpty()
+                ? QString("The game could not be opened.") : gameStatus->text());
+            return 1;
+        }
+        return launch() ? 0 : 1;
+    }
+
+private:
     void saveAndPlay() {
         if (!save())
             return;
@@ -3528,6 +3786,74 @@ private:
         savePreferences();
         QWidget::closeEvent(event);
     }
+
+    // ----- drag and drop -----
+
+    static QStringList localPathsOf(const QMimeData *mime) {
+        QStringList out;
+        if (mime && mime->hasUrls())
+            for (const QUrl &u : mime->urls())
+                if (u.isLocalFile())
+                    out << u.toLocalFile();
+        return out;
+    }
+
+    void dragEnterEvent(QDragEnterEvent *event) override {
+        if (!localPathsOf(event->mimeData()).isEmpty())
+            event->acceptProposedAction();
+    }
+
+    void dropEvent(QDropEvent *event) override {
+        const QStringList paths = localPathsOf(event->mimeData());
+        if (paths.isEmpty())
+            return;
+        event->acceptProposedAction();
+        // Dialogs must not open inside the drop itself: the program the files came
+        // from is held up until it returns.
+        QTimer::singleShot(0, this, [this, paths]() { handleDroppedPaths(paths); });
+    }
+
+    // One game opens; one folder that is not a game is scanned for games; several
+    // games are added to the library. Anything else is ignored.
+    void handleDroppedPaths(const QStringList &paths) {
+        QStringList games, folders;
+        for (const QString &raw : paths) {
+            const QString path = normalizeUserPath(raw);
+            const QFileInfo fi(path);
+            QString why;
+            if (fi.isFile() ? isDataFileName(fi.fileName()) : looksLikeGame(path, &why))
+                games << path;
+            else if (fi.isDir())
+                folders << path;
+        }
+        if (games.isEmpty() && folders.isEmpty()) {
+            QMessageBox::information(this, "Nothing to add",
+                "Drop a game folder, a game data file (.ags, .exe, ac2game.dat) or a folder with games in it.");
+            return;
+        }
+        if (games.size() == 1 && folders.isEmpty()) {
+            lastGameDir = QFileInfo(games.first()).absolutePath();
+            switchToGame(games.first());
+            return;
+        }
+        if (games.isEmpty() && folders.size() == 1) {
+            lastGameDir = QFileInfo(folders.first()).absolutePath();
+            scanAndAdd(folders.first());
+            return;
+        }
+        int added = 0;
+        for (const QString &g : games)
+            added += addGameToLibrary(g);
+        refreshLibrary();
+        QString text = QString("%1 game(s) added to the library.").arg(added);
+        if (added < games.size())
+            text += QString("\n%1 were already there.").arg(games.size() - added);
+        if (!folders.isEmpty())
+            text += "\nFolders that are not games themselves were skipped: drop one on its own to scan it.";
+        QMessageBox::information(this, "Games library", text);
+        if (currentGame.isEmpty() && !games.isEmpty())
+            selectGame(games.first());
+    }
 };
 
 
@@ -3535,12 +3861,27 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
 
     QString initialGame;
+    bool play = false;
     const QStringList args = app.arguments();
     for (int i = 1; i < args.size(); ++i) {
         if (args[i] == "--launcher" || args[i] == "-l")
             continue; // accepted for backward compatibility, no longer needed
+        if (args[i] == "--play") {
+            play = true;
+            continue;
+        }
         if (!args[i].startsWith('-'))
             initialGame = args[i];
+    }
+
+    if (play) {
+        // No window: start the game with its saved settings, like a shortcut would.
+        if (initialGame.isEmpty()) {
+            std::fprintf(stderr, "usage: agssetup --play <game folder or data file>\n");
+            return 2;
+        }
+        AGSSetup launcher(initialGame);
+        return launcher.playFromCommandLine();
     }
 
     // The window must outlive this scope: it has to still exist when

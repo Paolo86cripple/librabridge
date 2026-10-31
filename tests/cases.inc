@@ -4,6 +4,8 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
+#include <QElapsedTimer>
+#include <QMimeData>
 #include <cstdio>
 
 namespace {
@@ -33,6 +35,11 @@ public:
     Clicker() {
         timer.setInterval(25);
         connect(&timer, &QTimer::timeout, this, [this]() {
+            if (auto *input = qobject_cast<QInputDialog *>(QApplication::activeModalWidget())) {
+                seen << "input:" + input->windowTitle();
+                input->accept(); // the first item / the typed default
+                return;
+            }
             auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
             if (!box)
                 return;
@@ -635,6 +642,282 @@ void testDownload(AGSSetup &w, const QString &work) {
     qunsetenv("AGSSETUP_SHADERS_URL");
 }
 
+
+// Waits for the stand-in engine (tests/ags below) to have written what it was started with.
+QStringList stubRun(const QString &outFile, int ms = 5000) {
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < ms) {
+        QFile f(outFile);
+        if (f.exists() && f.open(QIODevice::ReadOnly)) {
+            const QString text = QString::fromUtf8(f.readAll());
+            if (text.contains("ENV:"))
+                return text.split('\n', Qt::SkipEmptyParts);
+        }
+        QTest::qWait(30);
+    }
+    return {};
+}
+
+QString readValue(const QString &cfg, const QString &section, const QString &key) {
+    IniFile f;
+    f.load(cfg);
+    return f.value(section, key);
+}
+
+void testFavoritesAndSort(AGSSetup &w, const QString &work) {
+    std::puts("== library: favourites and sort order");
+    struct G { const char *name; const char *fav; const char *last; };
+    const G games[] = {{"Sortalpha", "0", "100"}, {"Sortbravo", "1", "0"}, {"Sortcharlie", "0", "300"}, {"Sortdelta", "1", "200"}};
+    for (const G &g : games) {
+        QString body = QString("[librabridge]\ngame_path=%1/sort/%2\nlast_played=%3\nlaunches=2\n").arg(work, g.name, g.last);
+        if (QString(g.fav) == "1")
+            body += "favorite=1\n";
+        writeFile(QDir(configDir()).filePath(QString("sort-%1.cfg").arg(g.name)), body.toUtf8());
+    }
+    auto orderOf = [](int mode) {
+        QStringList names;
+        for (const GameEntry &e : configuredGames(100000, mode))
+            if (e.name.startsWith("Sort"))
+                names << e.name;
+        return names;
+    };
+    check(orderOf(SortByName) == QStringList({"Sortbravo", "Sortdelta", "Sortalpha", "Sortcharlie"}),
+          "by name: favourites first, then A-Z: " + orderOf(SortByName).join(","));
+    check(orderOf(SortByRecent) == QStringList({"Sortdelta", "Sortbravo", "Sortcharlie", "Sortalpha"}),
+          "recently played: favourites first, then the latest start first: " + orderOf(SortByRecent).join(","));
+
+    w.librarySort->setCurrentIndex(1);
+    QStringList shown;
+    QListWidgetItem *charlie = nullptr, *bravo = nullptr;
+    for (int i = 0; i < w.libraryList->count(); ++i) {
+        const QString t = w.libraryList->item(i)->text();
+        if (t.contains("Sort")) {
+            shown << t;
+            if (t.contains("Sortcharlie")) charlie = w.libraryList->item(i);
+            if (t.contains("Sortbravo")) bravo = w.libraryList->item(i);
+        }
+    }
+    check(shown.size() == 4 && shown[0].contains("Sortdelta") && shown[1].contains("Sortbravo"),
+          "the list follows the sort selector: " + shown.join(" | "));
+    check(bravo && bravo->text().startsWith(QString::fromUtf8("★ ")), "a favourite shows a star");
+    check(charlie && charlie->toolTip().contains("Last played") && charlie->toolTip().contains("2 time"),
+          "the tooltip says when it was last played");
+    check(w.librarySortMode == SortByRecent, "the choice is kept for saving");
+    w.librarySort->setCurrentIndex(0);
+
+    // favourite on the OPEN game must survive that game's own Save
+    const QString game = makeGame(work + "/fav/Open");
+    w.selectGame(game);
+    w.setFavorite(w.cfgPath, true);
+    check(readValue(w.cfgPath, "librabridge", "favorite") == "1", "favourite is written to the settings file");
+    w.shaderParams = "Y=2";
+    check(w.save(), "save the open game afterwards");
+    check(readValue(w.cfgPath, "librabridge", "favorite") == "1" && readValue(w.cfgPath, "librabridge", "shader_params") == "Y=2",
+          "Save keeps the favourite (the in-memory copy was updated too)");
+    w.setFavorite(w.cfgPath, false);
+    w.save();
+    check(!QFileInfo::exists(w.cfgPath) || readValue(w.cfgPath, "librabridge", "favorite").isEmpty(), "and un-favouriting sticks too");
+}
+
+void testLaunchRecording(AGSSetup &w, const QString &work, const QString &stubOut) {
+    std::puts("== launch: what the engine is started with, and the play record");
+    Clicker clicker;
+    const QString game = makeGame(work + "/play/Played");
+    w.selectGame(game);
+    const QString preset = writeFile(work + "/play/a.slangp", "shaders = 0\n");
+    w.shaderEnabled->setChecked(true);
+    w.driver->setCurrentIndex(w.driver->findData("OGL"));
+    w.setShaderPreset(preset);
+    w.shaderParams = "BRIGHT=0.7";
+    w.closeOnPlayBox->setChecked(false);
+
+    QFile::remove(stubOut);
+    w.saveAndPlay();
+    QStringList run = stubRun(stubOut);
+    check(run.size() >= 4 && run[0] == "--conf" && run[1] == w.cfgPath && run[2] == game,
+          "the engine gets --conf <settings file> <game>: " + run.mid(0, 3).join(" "));
+    check(run.value(run.size() - 1) == "ENV:" + preset + "|BRIGHT=0.7", "and the preset and parameters in its environment");
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const qint64 played = readValue(w.cfgPath, "librabridge", "last_played").toLongLong();
+    check(played > 0 && now - played < 10, "the start time is recorded");
+    check(readValue(w.cfgPath, "librabridge", "launches") == "1", "one start counted");
+
+    QFile::remove(stubOut);
+    w.saveAndPlay();
+    stubRun(stubOut);
+    check(readValue(w.cfgPath, "librabridge", "launches") == "2", "a second start makes two");
+    w.shaderParams = "BRIGHT=0.9";
+    w.save();
+    check(readValue(w.cfgPath, "librabridge", "launches") == "2" && readValue(w.cfgPath, "librabridge", "last_played").toLongLong() >= played,
+          "a later Save does not erase the record");
+    QListWidgetItem *item = itemFor(w, game);
+    check(item && item->toolTip().contains("Last played"), "the library shows when it was last played");
+    check(!w.isDirty(), "recording a start does not make the game 'modified'");
+}
+
+void testPlayCommandLine(const QString &work, const QString &stubOut) {
+    std::puts("== --play: start a game without the window");
+    Clicker clicker;
+    const QString game = makeGame(work + "/cli/Direct");
+    QFile::remove(stubOut);
+    int rc = -1;
+    {
+        AGSSetup launcher{game};
+        rc = launcher.playFromCommandLine();
+    }
+    QStringList run = stubRun(stubOut);
+    check(rc == 0 && run.size() >= 3 && run[0] == "--conf" && run[2] == game, "starts the engine with the game's settings");
+    check(QFileInfo::exists(QDir(configDir()).filePath(gameKey(game) + ".cfg")), "the game joined the library, as when opened");
+
+    clicker.seen.clear();
+    int bad;
+    {
+        AGSSetup launcher{work + "/cli/does-not-exist"};
+        bad = launcher.playFromCommandLine();
+    }
+    check(bad == 1 && clicker.seen.contains("Game not found"), "an unknown game gives a message and a non-zero result");
+}
+
+void testDesktopShortcuts(AGSSetup &w, const QString &work) {
+    std::puts("== desktop shortcuts");
+    Clicker clicker;
+    const QString text = DesktopEntryText("My \"Game\"\n100%", "/opt/ags setup/agssetup", "/games/It's $HOME/x");
+    check(text.contains("Name=My \"Game\" 100%\n"), "the name is one line");
+    check(text.contains("Exec=\"/opt/ags setup/agssetup\" --play \"/games/It's \\\\$HOME/x\"\n"),
+          "spaces and $ are quoted and escaped as the spec says");
+    check(DesktopEntryText("g", "/b/agssetup", "/g/50%/x").contains("--play /g/50%%/x\n"), "a percent sign is doubled");
+    check(DesktopEntryText("g", "/b/agssetup", "/g/a\\b").contains("--play \"/g/a\\\\\\\\b\"\n"), "a backslash survives both escape layers");
+    check(text.contains("Type=Application\n") && text.contains("Terminal=false\n") && text.contains("Categories=Game;"),
+          "it is a game launcher entry");
+
+    const QString game = makeGame(work + "/shortcut/Short Game");
+    w.selectGame(game);
+    w.refreshLibrary();
+    QListWidgetItem *item = itemFor(w, game);
+    const QString key = QFileInfo(w.cfgPath).completeBaseName();
+    const QString file = DesktopShortcutPath(key);
+    QFile::remove(file);
+    w.createDesktopShortcut(item);
+    QFile f(file);
+    const bool opened = f.open(QIODevice::ReadOnly);
+    const QString body = QString::fromUtf8(f.readAll());
+    check(opened && body.contains("Name=Short Game\n") && body.contains(" --play ") && body.contains("Short Game"),
+          "the shortcut is written under the applications folder: " + file);
+    check(body.contains(QCoreApplication::applicationFilePath()), "and starts this agssetup");
+    check(bool(QFile::permissions(file) & QFileDevice::ExeOwner), "it is marked executable");
+    w.forgetGames({w.cfgPath});
+    check(!QFileInfo::exists(file), "removing the game from the library removes its shortcut");
+    w.clearGame("");
+    w.refreshLibrary();
+}
+
+void testDragAndDrop(AGSSetup &w, const QString &work) {
+    std::puts("== drag and drop");
+    Clicker clicker;
+    clicker.answers["Unsaved changes"] = QMessageBox::Discard;
+    const QString one = makeGame(work + "/drop/One");
+
+    QMimeData files;
+    files.setUrls({QUrl::fromLocalFile(one)});
+    QDragEnterEvent enter(QPoint(10, 10), Qt::CopyAction, &files, Qt::LeftButton, Qt::NoModifier);
+    enter.ignore();
+    w.dragEnterEvent(&enter);
+    check(enter.isAccepted(), "dragging files over the window is accepted");
+    QMimeData text;
+    text.setText("just words");
+    QDragEnterEvent word(QPoint(10, 10), Qt::CopyAction, &text, Qt::LeftButton, Qt::NoModifier);
+    word.ignore();
+    w.dragEnterEvent(&word);
+    check(!word.isAccepted(), "dragging plain text is not");
+    bool anyAccepts = false;
+    for (QLineEdit *e : w.findChildren<QLineEdit *>())
+        anyAccepts = anyAccepts || e->acceptDrops();
+    check(!anyAccepts, "no text field takes the drop (it would paste the path as text)");
+
+    QDropEvent drop(QPointF(10, 10), Qt::CopyAction, &files, Qt::LeftButton, Qt::NoModifier);
+    w.dropEvent(&drop);
+    QTest::qWait(150);
+    check(w.currentGame == one, "dropping a game opens it");
+
+    // two games at once: both join the library, the open one stays
+    const QString a = makeGame(work + "/drop/A");
+    const QString b = makeGame(work + "/drop/B");
+    clicker.seen.clear();
+    w.handleDroppedPaths({a, b});
+    check(itemFor(w, a) && itemFor(w, b) && w.currentGame == one, "several games are added without changing the open one");
+    check(clicker.seen.contains("Games library"), "and the user is told");
+
+    // something that is not a game
+    const QString note = writeFile(work + "/drop/notes.txt", "hi");
+    clicker.seen.clear();
+    const int before = w.libraryList->count();
+    w.handleDroppedPaths({note});
+    check(clicker.seen.contains("Nothing to add") && w.libraryList->count() == before, "a stray file is refused with a hint");
+
+    // a folder of games is scanned
+    makeGame(work + "/drop/Shelf/Deep");
+    {
+        ScanDialogDriver drv;
+        w.handleDroppedPaths({work + "/drop/Shelf"});
+        check(drv.title.contains("1 new"), "a folder that is not a game is scanned for games");
+    }
+    check(w.currentGame == QFileInfo(work + "/drop/Shelf/Deep").absoluteFilePath(), "and the single game found opens");
+}
+
+void testProfileForAllGames(AGSSetup &w, const QString &work) {
+    std::puts("== profile: apply to all games");
+    Clicker clicker;
+    clicker.answers["Unsaved changes"] = QMessageBox::Discard;
+    const AGSSetup::Binding *other = nullptr;
+    for (const AGSSetup::Binding &b : w.bindings)
+        if (b.section != "librabridge" && !other)
+            other = &b;
+    check(other != nullptr, "there is an ordinary option to carry in the profile");
+    if (!other)
+        return;
+
+    const QString a = makeGame(work + "/profall/A");
+    const QString b = makeGame(work + "/profall/B");
+    w.selectGame(a);
+    w.addGameToLibrary(b);
+    const QString cfgB = QDir(configDir()).filePath(gameKey(b) + ".cfg");
+    w.updateGameCfg(cfgB, [](IniFile &f) {
+        f.setValue("librabridge", "shader_params", "OLD=1");
+        f.setValue("librabridge", "preview_image", "/keep/me.png");
+        f.setValue("librabridge", "launches", "7");
+    });
+    QDir().mkpath(profilesDir());
+    writeFile(QDir(profilesDir()).filePath("CRT.cfg"),
+              ("[librabridge]\nshader_preset=/s/crt.slangp\npreview_image=/other/pic.png\n[" + other->section + "]\n" +
+               other->key + "=PROFILE\n").toUtf8());
+
+    IniFile profile;
+    profile.load(QDir(profilesDir()).filePath("CRT.cfg"));
+    const int total = configuredGames(100000).size();
+    check(w.applyProfileToAllGames(profile) == total, "every game in the library is rewritten");
+    check(readValue(cfgB, "librabridge", "shader_preset") == "/s/crt.slangp" && readValue(cfgB, other->section, other->key) == "PROFILE",
+          "the profile's options reached another game");
+    check(readValue(cfgB, "librabridge", "preview_image") == "/keep/me.png", "its preview picture is not replaced by the profile's");
+    check(readValue(cfgB, "librabridge", "shader_params").isEmpty(), "parameters of the old preset are dropped with it");
+    check(readValue(cfgB, "librabridge", "launches") == "7" && readValue(cfgB, "librabridge", "game_path") == b,
+          "its own record and path are untouched");
+
+    // through the dialogs, with the open game dirty: settled first, then reloaded
+    w.selectGame(a);
+    w.shaderParams = "Q=1";
+    check(w.isDirty(), "the open game has unsaved edits");
+    clicker.seen.clear();
+    w.applyProfileToAllGamesDialog();
+    check(clicker.seen.contains("Unsaved changes") && clicker.seen.contains("Apply a profile to all games"), "the dialogs ask first");
+    check(w.shaderPath->text() == "/s/crt.slangp" && w.shaderParams.isEmpty() && !w.isDirty(), "the open game shows what is on disk afterwards");
+
+    // the same rule for a single game
+    w.ini.setValue("librabridge", "shader_params", "Z=1");
+    w.applyProfileFile(profile, "test");
+    check(!w.ini.contains("librabridge", "shader_params"), "one game: parameters of the old preset are dropped too");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -645,6 +928,13 @@ int main(int argc, char **argv) {
     // keep every bit of state inside the work folder
     qputenv("XDG_CONFIG_HOME", (work + "/xdg-config").toUtf8());
     qputenv("XDG_DATA_HOME", (work + "/xdg-data").toUtf8());
+
+    // A stand-in engine: records how it was started so the launches can be checked.
+    const QString stubOut = work + "/stub-out.txt";
+    qputenv("AGS_STUB_OUT", stubOut.toUtf8());
+    const QString stub = QCoreApplication::applicationDirPath() + "/ags";
+    writeFile(stub, "#!/bin/sh\n{ printf '%s\\n' \"$@\"; echo \"ENV:$AGS_LIBRASHADER_PRESET|$AGS_LIBRASHADER_PARAMS\"; } > \"$AGS_STUB_OUT\"\n");
+    QFile(stub).setPermissions(QFile(stub).permissions() | QFileDevice::ExeOwner | QFileDevice::ExeGroup | QFileDevice::ExeOther);
 
     const bool haveLibra = QFileInfo::exists(QCoreApplication::applicationDirPath() + "/librashader.so");
     if (haveLibra) {
@@ -660,6 +950,12 @@ int main(int argc, char **argv) {
     testLibraryCap(work);
     testScan(w, work);
     testMissingMarks(w, work);
+    testFavoritesAndSort(w, work);
+    testLaunchRecording(w, work, stubOut);
+    testPlayCommandLine(work, stubOut);
+    testDesktopShortcuts(w, work);
+    testDragAndDrop(w, work);
+    testProfileForAllGames(w, work);
     testParams(w, work);
     testListParams(work, haveLibra);
     testDownload(w, work);

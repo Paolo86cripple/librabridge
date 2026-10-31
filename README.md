@@ -320,6 +320,27 @@ Sotto le schede:
 
 Le chiavi che la GUI non gestisce restano esattamente come erano.
 
+Nella libreria (clic destro su un gioco):
+
+- **Preferiti** (★) restano in cima; l'ordinamento si sceglie sopra la lista
+  (per nome o per ultimo avvio). L'ultimo avvio e il numero di avvii da qui
+  compaiono nel tooltip; il tempo di gioco non è tracciato perché il motore
+  parte staccato dalla GUI.
+- **Crea collegamento sul desktop** scrive un `.desktop` in
+  `~/.local/share/applications` che lancia `agssetup --play <gioco>`; viene
+  rimosso insieme al gioco dalla libreria.
+- **Applica un profilo a tutti i giochi** (anche dal menu Profile): riscrive le
+  opzioni dei giochi in libreria, senza toccare percorso, anteprima e storico
+  avvii; se il profilo cambia preset, i parametri del vecchio preset vengono
+  scartati.
+- **Trascina cartelle o file di gioco** sulla finestra: un gioco si apre, più
+  giochi si aggiungono alla libreria, una cartella che non è un gioco viene
+  scansionata.
+
+Da riga di comando, `agssetup --play <gioco>` avvia il gioco con le sue
+impostazioni salvate, senza mostrare la finestra.
+
+
 Le schede delle opzioni scorrono se la finestra è bassa (la scheda Shader contiene
 un'anteprima da 360 px), mentre Save e Save && Play restano sempre visibili.
 
