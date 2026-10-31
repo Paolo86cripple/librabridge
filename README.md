@@ -190,20 +190,22 @@ scegli comunque un `.glslp`/`.cgp`, lo dice nella preview e prima di avviare.
 
 ## Revisioni fissate e canary notturno
 
-Le build su `push` e quelle lanciate a mano compilano revisioni **fissate** di
-AGS e librashader (`AGS_PINNED` e `LIBRASHADER_PINNED` in
-`.github/workflows/build.yml`): il patch è scritto contro quell'AGS e il bridge
-chiama l'API C di librashader tramite un header copiato nel repo, quindi le due
-cose devono muoversi insieme al patch. Ogni notte la CI compila invece la punta
+La build **stable** (push, tag, avvio manuale) compila sempre l'**ultima release
+stabile di AGS** (quella che GitHub indica come "latest", niente pre-release),
+risolta al momento della build, e la revisione di librashader fissata in
+`LIBRASHADER_PINNED` (`.github/workflows/build.yml`): il bridge chiama l'API C
+di librashader tramite un header copiato nel repo, quindi librashader si muove
+insieme a quell'header. Il patch si applica sia alla release stabile sia a
+`master` di AGS. Ogni notte la CI compila invece la punta
 di `master` di entrambi e pubblica un artifact separato,
 `ags-librashader-linux-x86_64-canary`: se diventa rosso, qualcosa a monte è
 cambiato (il patch non applica più, o l'ABI di librashader è cambiata) e lo
 vedi prima che ti arrivi una build rotta.
 
-Per aggiornare le revisioni: guarda cosa ha cambiato il canary, verifica che
-`git apply --check librashader-integration.patch` passi sulla nuova revisione di
-AGS (rifacendo il patch se serve) e che la build e un gioco funzionino, poi
-cambia i due SHA nel workflow. Da *Actions → Run workflow* puoi anche compilare
+Se una nuova release di AGS rompe il patch, la build stable si ferma al passo
+del patch: rifai `librashader-integration.patch` (verifica con
+`git apply --check`) e controlla build e un gioco. Per librashader basta cambiare
+lo SHA nel workflow. Da *Actions → Run workflow* puoi anche compilare
 una revisione qualsiasi senza toccare il file (campi `ags_ref` e `librashader_ref`).
 
 ## Release

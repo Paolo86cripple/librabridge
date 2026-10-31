@@ -12,7 +12,7 @@ on:
         required: false
         default: ''
       ags_ref:
-        description: 'adventuregamestudio/ags branch, tag or commit to build (empty = the pinned revision)'
+        description: 'adventuregamestudio/ags branch, tag or commit to build (empty = the latest stable AGS release)'
         required: false
         default: ''
       librashader_ref:
@@ -26,12 +26,13 @@ on:
     - cron: '0 2 * * *'
 
 env:
-  # Known-good revisions, used by push and manual runs unless overridden above.
-  # AGS is patched by librashader-integration.patch and librashader's C API is
-  # called through the vendored Engine/gfx/librashader/librashader.h, so the two
-  # have to move together with the patch: to update, bump both here, check that the
-  # patch still applies (git apply --check) and that the build and a game still work.
-  AGS_PINNED: c53a80181f103d34893495686f43f1efd3612fab            # 2026-09-20
+  # Stable builds use the LATEST STABLE AGS RELEASE (resolved at build time from
+  # GitHub's "latest release", which skips drafts and pre-releases); the canary
+  # builds AGS master. If a new AGS release breaks librashader-integration.patch,
+  # the stable build fails at the patch step: rebase the patch then.
+  # librashader's C API is called through the vendored
+  # Engine/gfx/librashader/librashader.h, so librashader stays pinned and moves
+  # together with that header: to update, bump it here and check the build.
   LIBRASHADER_PINNED: 87e8a97b50516d997defeaa168173dcd185d4022    # 2026-07-04, v0.12.0
 
 jobs:
@@ -73,13 +74,21 @@ jobs:
           VARIANT: ${{ matrix.variant }}
           INPUT_AGS: ${{ github.event.inputs.ags_ref }}
           INPUT_LIBRASHADER: ${{ github.event.inputs.librashader_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$VARIANT" = "canary" ]; then
             ags=master
             librashader=master
             artifact=ags-librashader-linux-x86_64-canary
           else
-            ags="${INPUT_AGS:-$AGS_PINNED}"
+            ags="$INPUT_AGS"
+            if [ -z "$ags" ]; then
+              ags="$(gh api repos/adventuregamestudio/ags/releases/latest --jq .tag_name)"
+              if [ -z "$ags" ]; then
+                echo "::error::could not find the latest AGS release"
+                exit 1
+              fi
+            fi
             librashader="${INPUT_LIBRASHADER:-$LIBRASHADER_PINNED}"
             artifact=ags-librashader-linux-x86_64
           fi
@@ -125,7 +134,7 @@ jobs:
           ref: ${{ env.LIBRASHADER_REF }}
           path: librashader
 
-      - name: Check that pinned revisions were really checked out
+      - name: Check that the requested revisions were really checked out
         run: |
           for pair in "ags:$AGS_REF" "librashader:$LIBRASHADER_REF"; do
             dir="${pair%%:*}"; want="${pair#*:}"
@@ -242,9 +251,9 @@ jobs:
           body: |
             Linux x86_64 builds of AGS with the librashader integration and the agssetup GUI.
 
-            - `ags-librashader-linux-x86_64.tar.gz` - stable: built from the pinned,
-              tested revisions of AGS and librashader (see this workflow's `AGS_PINNED` /
-              `LIBRASHADER_PINNED`, and each tarball's own `BUILD_INFO.txt`).
+            - `ags-librashader-linux-x86_64.tar.gz` - stable: built from the latest
+              stable AGS release at the time of the build and the tested librashader revision
+              (see this workflow's `LIBRASHADER_PINNED`, and each tarball's own `BUILD_INFO.txt`).
             - `ags-librashader-linux-x86_64-canary.tar.gz` - canary: built from the current
               tip of AGS and librashader `master`. Tracks upstream; may not work. Present
               only if that build succeeded for this tag.

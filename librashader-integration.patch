@@ -183,7 +183,7 @@ index 1d4ee62..887e19d 100644
      }
  }
 diff --git a/Engine/gfx/ali3dogl.h b/Engine/gfx/ali3dogl.h
-index 6b6194e..ef23e1f 100644
+index 6b6194e..92d9a19 100644
 --- a/Engine/gfx/ali3dogl.h
 +++ b/Engine/gfx/ali3dogl.h
 @@ -31,6 +31,7 @@
@@ -194,10 +194,10 @@ index 6b6194e..ef23e1f 100644
  
  namespace AGS
  {
-@@ -494,6 +495,19 @@ private:
-     // Texture for rendering in native resolution
-     OGLBitmap *_nativeSurface = nullptr;
- 
+@@ -491,6 +492,19 @@ private:
+     // rendering to screen directly. This is known as supersampling mode
+     bool _canRenderToTexture {};
+     bool _doRenderToTexture {};
 +    // librashader integration: when a shader preset is configured (see
 +    // InitLibrashaderIfConfigured in the .cpp), _librashader runs the
 +    // RetroArch-style shader chain on _nativeSurface's contents, writing
@@ -211,9 +211,9 @@ index 6b6194e..ef23e1f 100644
 +    void UpdateLibrashaderTarget(const Size &out_size);
 +    void DestroyLibrashaderTarget();
 +
-     BackbufferState _screenBackbuffer;
-     BackbufferState _nativeBackbuffer;
-     BackbufferState *_currentBackbuffer = nullptr;
+     // Texture for rendering in native resolution
+     OGLBitmap *_nativeSurface = nullptr;
+ 
 diff --git a/Engine/gfx/librashader/librashader.h b/Engine/gfx/librashader/librashader.h
 new file mode 100644
 index 0000000..ae0e8ec
