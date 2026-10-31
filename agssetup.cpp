@@ -2313,6 +2313,8 @@ private:
             item->setData(Qt::UserRole + 1, g.cfgFile);
             item->setData(Qt::UserRole + 2, label); // without the "(missing)" mark
             item->setData(Qt::UserRole + 3, playInfo(g));
+            item->setData(Qt::UserRole + 4, g.favorite);
+            item->setData(Qt::UserRole + 5, g.name); // the plain name, for shortcuts
             markMissing(item, !gi.exists());
         }
         updatingLibrary = false;
@@ -2559,7 +2561,7 @@ private:
         QAction *locateFile = missing ? menu.addAction("Locate game data file...") : nullptr;
         QAction *locateFolder = missing ? menu.addAction("Locate game folder...") : nullptr;
         const QString cfgFile = item ? item->data(Qt::UserRole + 1).toString() : QString();
-        const bool isFavorite = item && item->text().startsWith(QString::fromUtf8("\u2605"));
+        const bool isFavorite = item && item->data(Qt::UserRole + 4).toBool();
         QAction *favorite = item ? menu.addAction(isFavorite ? "Remove from favourites" : "Add to favourites") : nullptr;
         const bool hasShortcut = item && QFileInfo::exists(DesktopShortcutPath(QFileInfo(cfgFile).completeBaseName()));
         QAction *shortcut = item ? menu.addAction(hasShortcut ? "Update the desktop shortcut"
@@ -2621,9 +2623,7 @@ private:
             QMessageBox::critical(this, "Desktop shortcut", "Could not create:\n" + QFileInfo(target).path());
             return;
         }
-        QString name = item->text();
-        name.remove(QString::fromUtf8("\u2605 "));
-        name.remove("  (missing)");
+        const QString name = item->data(Qt::UserRole + 5).toString();
         QSaveFile f(target);
         if (!f.open(QIODevice::WriteOnly) ||
             f.write(DesktopEntryText(name, QCoreApplication::applicationFilePath(), game).toUtf8()) < 0 ||
