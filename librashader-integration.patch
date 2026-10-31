@@ -12,18 +12,19 @@ index 2f73584..ecfd98b 100644
      gfx/gfx_util.cpp
      gfx/gfx_util.h
 diff --git a/Engine/gfx/ali3dogl.cpp b/Engine/gfx/ali3dogl.cpp
-index 1d4ee62..887e19d 100644
+index 1d4ee62..27f7c3b 100644
 --- a/Engine/gfx/ali3dogl.cpp
 +++ b/Engine/gfx/ali3dogl.cpp
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,8 @@
  #if AGS_HAS_OPENGL
  #include "gfx/ali3dogl.h"
  #include <algorithm>
 +#include <cstdlib>
++#include <type_traits>
  #include <stack>
  #include <SDL.h>
  #include "ac/sys_events.h"
-@@ -154,7 +155,9 @@ void OGLGraphicsDriver::RenderSpritesAtScreenResolution(bool enabled)
+@@ -154,7 +156,9 @@ void OGLGraphicsDriver::RenderSpritesAtScreenResolution(bool enabled)
  {
    if (_canRenderToTexture)
    {
@@ -34,7 +35,7 @@ index 1d4ee62..887e19d 100644
    }
  
    if (_doRenderToTexture)
-@@ -276,16 +279,25 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
+@@ -276,16 +280,25 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
    // First setup GL attributes before creating SDL GL window
    if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY) != 0)
      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Error occured setting attribute SDL_GL_CONTEXT_PROFILE_MASK: %s", SDL_GetError());
@@ -62,7 +63,7 @@ index 1d4ee62..887e19d 100644
      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Error occured setting attribute SDL_GL_CONTEXT_MINOR_VERSION: %s", SDL_GetError());
  #endif
    // minimum number of bits for the depth buffer
-@@ -332,6 +344,9 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
+@@ -332,6 +345,9 @@ bool OGLGraphicsDriver::CreateWindowAndGlContext(const DisplayMode &mode)
  #endif
    _sdlWindow = sdl_window;
    _sdlGlContext = sdlgl_ctx;
@@ -72,7 +73,7 @@ index 1d4ee62..887e19d 100644
  #if AGS_PLATFORM_OS_IOS
    // The SDL implementation of the iOS OpenGL view (SDL_uikitopenglview.m) generates its own framebuffer to target the renderbuffer
    // Instead of using framebuffer 0, we ask OpenGL to get the current framebuffer.
-@@ -722,6 +737,55 @@ void OGLGraphicsDriver::SetupViewport()
+@@ -722,6 +738,85 @@ void OGLGraphicsDriver::SetupViewport()
      _filter->GetFilteringForStandardSprite(txfilter, txclamp);
    _screenBackbuffer = BackbufferState(_screenFramebuffer, Size(_mode.Width, _mode.Height), _srcRect.GetSize(),
        viewport, projection, _scaling, txfilter, txclamp);
@@ -82,6 +83,35 @@ index 1d4ee62..887e19d 100644
 +  // game's aspect ratio when the window/screen has a different one.
 +  UpdateLibrashaderTarget(_dstRect.GetSize());
 +}
++
++// The stable and the development lines of AGS differ in two small details that the
++// librashader code touches; these helpers let the same patch build on both.
++namespace
++{
++// CreateRenderTargetDDB's last argument is `bool opaque` in older AGS and an int of
++// kTxFlags_* flags in newer ones: build the "opaque" value of whichever it is.
++template <typename Ret, typename Cls, typename A, typename B, typename C, typename P>
++P LibrashaderOpaqueArg(Ret (Cls::*)(A, B, C, P))
++{
++    return static_cast<P>(std::is_same<P, bool>::value ? 1 : 2 /* kTxFlags_Opaque */);
++}
++
++// The texture of a DDB: GetTexture() in newer AGS, the public _data in older ones.
++template <typename T>
++auto LibrashaderTextureImpl(const T *bmp, int) -> decltype(bmp->GetTexture())
++{
++    return bmp->GetTexture();
++}
++template <typename T>
++OGLTexture *LibrashaderTextureImpl(const T *bmp, long)
++{
++    return bmp->_data.get();
++}
++unsigned int LibrashaderGlTexture(const OGLBitmap *bmp)
++{
++    return LibrashaderTextureImpl(bmp, 0)->_tiles[0].texture;
++}
++} // namespace
 +
 +void OGLGraphicsDriver::InitLibrashaderIfConfigured()
 +{
@@ -115,7 +145,8 @@ index 1d4ee62..887e19d 100644
 +    if (out_size.Width <= 0 || out_size.Height <= 0)
 +        return;
 +    _librashaderTarget = (OGLBitmap*)CreateRenderTargetDDB(
-+        out_size.Width, out_size.Height, _mode.ColorDepth, kTxFlags_Opaque);
++        out_size.Width, out_size.Height, _mode.ColorDepth,
++        LibrashaderOpaqueArg(&OGLGraphicsDriver::CreateRenderTargetDDB));
 +}
 +
 +void OGLGraphicsDriver::DestroyLibrashaderTarget()
@@ -128,7 +159,7 @@ index 1d4ee62..887e19d 100644
  }
  
  bool OGLGraphicsDriver::SetDisplayMode(const DisplayMode &mode)
-@@ -847,6 +911,8 @@ void OGLGraphicsDriver::UnInit()
+@@ -847,6 +942,8 @@ void OGLGraphicsDriver::UnInit()
      _nativeSurface = nullptr;
      _nativeBackbuffer = BackbufferState();
    }
@@ -137,7 +168,7 @@ index 1d4ee62..887e19d 100644
  
    DeleteShaderProgram(_transparencyShader);
    DeleteShaderProgram(_tintShader);
-@@ -1184,9 +1250,42 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
+@@ -1184,9 +1281,42 @@ void OGLGraphicsDriver::RenderImpl(bool clearDrawListAfterwards)
  
      if (_doRenderToTexture)
      {
@@ -155,8 +186,8 @@ index 1d4ee62..887e19d 100644
 +            // The target is sized to the destination rect (see SetupViewport)
 +            const Size out_sz(_librashaderTarget->GetWidth(), _librashaderTarget->GetHeight());
 +            const bool ok = _librashader->Frame(_librashaderFrameCount++,
-+                _nativeSurface->GetTexture()->_tiles[0].texture, in_sz.Width, in_sz.Height,
-+                _librashaderTarget->GetTexture()->_tiles[0].texture, out_sz.Width, out_sz.Height);
++                LibrashaderGlTexture(_nativeSurface), in_sz.Width, in_sz.Height,
++                LibrashaderGlTexture(_librashaderTarget), out_sz.Width, out_sz.Height);
 +            SetBackbufferState(&_screenBackbuffer, true); // librashader unbinds our FBO/state; restore it
 +            if (ok)
 +            {
