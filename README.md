@@ -272,6 +272,12 @@ Le schede coprono tutto ciò che offre winsetup.exe e altro:
   messaggio, invece di piantarsi.
 
   Intorno al preset:
+  - **Presets** apre un menu con i preset **preferiti** (sezione in alto) e gli
+    ultimi 12 **usati**, uguali per tutti i giochi: un clic e il preset è
+    applicato (i parametri del preset precedente vengono scartati). Un preset
+    entra tra i recenti quando lo scegli e quando avvii un gioco con quel preset;
+    dal menu puoi aggiungere o togliere quello corrente dai preferiti e svuotare
+    i recenti. Se il file non c'è più la voce è grigia e marcata "missing".
   - **Get shaders...** scarica la raccolta `libretro/slang-shaders` in
     `~/.local/share/agssetup/slang-shaders` (con una barra di avanzamento
     annullabile; la copia nuova sostituisce quella vecchia solo se è integra, e un

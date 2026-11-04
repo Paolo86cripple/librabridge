@@ -918,6 +918,119 @@ void testProfileForAllGames(AGSSetup &w, const QString &work) {
     check(!w.ini.contains("librabridge", "shader_params"), "one game: parameters of the old preset are dropped too");
 }
 
+
+QStringList menuLabels(QMenu *m) {
+    QStringList out;
+    for (QAction *a : m->actions())
+        out << (a->isSeparator() && a->text().isEmpty() ? QString("---") : a->text());
+    return out;
+}
+
+QAction *menuAction(QMenu *m, const QString &startsWith) {
+    for (QAction *a : m->actions())
+        if (!a->isSeparator() && a->text().startsWith(startsWith))
+            return a;
+    return nullptr;
+}
+
+void testPresetMenu(AGSSetup &w, const QString &work, const QString &stubOut) {
+    std::puts("== shader presets: recent and favourites");
+    Clicker clicker;
+    w.storePresetList(PREFS_RECENT_PRESETS, QStringList());
+    w.storePresetList(PREFS_FAVORITE_PRESETS, QStringList());
+    const QString game = makeGame(work + "/presetgame/G");
+    w.selectGame(game);
+
+    QStringList files;
+    for (int i = 1; i <= 14; ++i)
+        files << writeFile(QString("%1/presets/pack%2/shader%3.slangp").arg(work).arg(i % 3).arg(i), "shaders = 0\n");
+    for (const QString &f : files)
+        w.setShaderPreset(f);
+    QStringList recent = w.presetList(PREFS_RECENT_PRESETS);
+    check(recent.size() == 12 && recent.first() == files.last() && recent.last() == files[2],
+          "the recent list keeps the last 12, newest first");
+    w.setShaderPreset(files[5]);
+    recent = w.presetList(PREFS_RECENT_PRESETS);
+    check(recent.size() == 12 && recent.first() == files[5] && recent.count(files[5]) == 1,
+          "choosing one again moves it to the top without a duplicate");
+    w.setShaderPreset(QDir::cleanPath(files[5] + "/../shader6.slangp"));
+    w.setShaderPreset(files[5] + "/../shader6.slangp"); // same file, another spelling
+    check(w.presetList(PREFS_RECENT_PRESETS).count(QDir::cleanPath(files[5] + "/../shader6.slangp")) == 1,
+          "the same file spelled differently is one entry");
+    const QString legacy = writeFile(work + "/presets/old.glslp", "shaders = 0\n");
+    const int before = w.presetList(PREFS_RECENT_PRESETS).size();
+    w.setShaderPreset(legacy);
+    check(w.presetList(PREFS_RECENT_PRESETS).size() == before && !w.presetList(PREFS_RECENT_PRESETS).contains(legacy),
+          "a legacy .glslp is not remembered");
+    w.setShaderPreset(QString());
+    check(w.presetList(PREFS_RECENT_PRESETS).size() == before, "clearing the preset remembers nothing");
+
+    QSettings direct(QSettings::IniFormat, QSettings::UserScope, "AGSSetup", "agssetup");
+    check(direct.value(PREFS_RECENT_PRESETS).toStringList() == w.presetList(PREFS_RECENT_PRESETS),
+          "the lists are stored in the preferences file");
+
+    // the menu
+    w.setShaderPreset(files[0]);
+    w.rebuildPresetsMenu();
+    QStringList labels = menuLabels(w.presetsMenu);
+    check(labels.contains("Recent") && !labels.contains("Favourites"), "recent section only, before any favourite: " + labels.join(" | "));
+    check(labels.contains(AGSSetup::presetLabel(files[0])) && AGSSetup::presetLabel(files[0]).contains("shader1") &&
+          AGSSetup::presetLabel(files[0]).contains("(pack1)"), "an entry shows its name and folder");
+    QAction *toggle = menuAction(w.presetsMenu, "Add the current preset");
+    check(toggle && toggle->isEnabled(), "the current preset can be added to favourites");
+    toggle->trigger();
+    check(w.isFavoritePreset(files[0]), "added");
+    w.rebuildPresetsMenu();
+    labels = menuLabels(w.presetsMenu);
+    const int favAt = labels.indexOf("Favourites"), recAt = labels.indexOf("Recent");
+    check(favAt >= 0 && recAt > favAt && labels[favAt + 1] == AGSSetup::presetLabel(files[0]),
+          "favourites come first and hold it");
+    int occurrences = 0;
+    for (const QString &l : labels)
+        occurrences += l == AGSSetup::presetLabel(files[0]);
+    check(occurrences == 1, "a favourite is not repeated under Recent");
+    check(menuAction(w.presetsMenu, "Remove the current preset"), "and the toggle now offers to remove it");
+
+    // applying one from the menu
+    w.setShaderPreset(files[7]);
+    w.shaderParams = "A=1";
+    QAction *fav = menuAction(w.presetsMenu, AGSSetup::presetLabel(files[0]));
+    check(fav && fav->isEnabled(), "the favourite can be picked");
+    fav->trigger();
+    check(w.shaderPath->text() == files[0] && w.shaderParams.isEmpty(),
+          "picking it sets the preset and drops the parameters of the previous one");
+
+    // a file that disappeared
+    QFile::remove(files[9]);
+    w.rebuildPresetsMenu();
+    QAction *gone = menuAction(w.presetsMenu, AGSSetup::presetLabel(files[9]));
+    check(gone && !gone->isEnabled() && gone->text().contains("missing"), "a preset whose file is gone is greyed out and marked");
+
+    // clearing the recent list keeps favourites
+    QAction *clear = menuAction(w.presetsMenu, "Clear the recent list");
+    check(clear && clear->isEnabled(), "the recent list can be cleared");
+    clear->trigger();
+    w.rebuildPresetsMenu();
+    labels = menuLabels(w.presetsMenu);
+    check(!labels.contains("Recent") && labels.contains("Favourites"), "favourites survive it");
+    w.shaderPath->setText(QString());
+    w.rebuildPresetsMenu();
+    check(!menuAction(w.presetsMenu, "Add the current preset")->isEnabled(), "with no preset chosen there is nothing to add");
+    w.setFavoritePreset(files[0], false);
+    w.rebuildPresetsMenu();
+    check(menuLabels(w.presetsMenu).contains("No presets used yet"), "an empty menu says so");
+
+    // starting a game with a preset counts as using it, even if it was loaded with the game
+    w.shaderEnabled->setChecked(true);
+    w.driver->setCurrentIndex(w.driver->findData("OGL"));
+    w.shaderPath->setText(files[11]);
+    w.closeOnPlayBox->setChecked(false);
+    QFile::remove(stubOut);
+    w.saveAndPlay();
+    stubRun(stubOut);
+    check(w.presetList(PREFS_RECENT_PRESETS).value(0) == files[11], "a game started with a preset puts it on the recent list");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -956,6 +1069,7 @@ int main(int argc, char **argv) {
     testDesktopShortcuts(w, work);
     testDragAndDrop(w, work);
     testProfileForAllGames(w, work);
+    testPresetMenu(w, work, stubOut);
     testParams(w, work);
     testListParams(work, haveLibra);
     testDownload(w, work);

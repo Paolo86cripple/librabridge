@@ -50,6 +50,7 @@
 #include <QHash>
 #include <algorithm>
 #include <QMenu>
+#include <QToolButton>
 #include <QAction>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -136,6 +137,9 @@ const char *PREFS_WINDOW_GEOMETRY = "Preferences/MainWindowGeometryV2";
 const char *PREFS_CLOSE_ON_PLAY = "Preferences/CloseOnPlay";
 const char *PREFS_SPLITTER = "Preferences/SplitterState";
 const char *PREFS_LIBRARY_SORT = "Preferences/LibrarySort";
+const char *PREFS_RECENT_PRESETS = "Shaders/RecentPresets";
+const char *PREFS_FAVORITE_PRESETS = "Shaders/FavoritePresets";
+const int MAX_RECENT_PRESETS = 12;
 
 // ---------------------------------------------------------------------------
 // Minimal INI model. QSettings is deliberately not used for the engine config:
@@ -1239,6 +1243,8 @@ private:
 
     QCheckBox *shaderEnabled = nullptr;
     QLineEdit *shaderPath = nullptr;
+    QToolButton *presetsBtn = nullptr;
+    QMenu *presetsMenu = nullptr;
     QString shaderParams;      // "NAME=value;..." overrides of the preset's parameters (see ParseParams)
     QString previewImagePath;  // picture the preview uses instead of the test pattern
     QPushButton *paramsBtn = nullptr;
@@ -1600,6 +1606,13 @@ private:
         shaderPath->setPlaceholderText("None - plain output");
         QPushButton *browseBtn = new QPushButton("Browse...", this);
         QPushButton *clearBtn = new QPushButton("Clear", this);
+        presetsBtn = new QToolButton(this);
+        presetsBtn->setText("Presets");
+        presetsBtn->setToolTip("Your favourite and recently used presets, one click to apply.");
+        presetsBtn->setPopupMode(QToolButton::InstantPopup);
+        presetsMenu = new QMenu(presetsBtn);
+        presetsBtn->setMenu(presetsMenu);
+        connect(presetsMenu, &QMenu::aboutToShow, this, &AGSSetup::rebuildPresetsMenu);
         connect(browseBtn, &QPushButton::clicked, this, &AGSSetup::browseShader);
         connect(clearBtn, &QPushButton::clicked, this, [this]() { setShaderPreset(QString()); });
         // Parameters belong to one preset: typing another path starts from its defaults.
@@ -1609,6 +1622,7 @@ private:
         });
         connect(shaderPath, &QLineEdit::textChanged, this, [this]() { updateParamsButton(); });
         row->addWidget(shaderPath, 1);
+        row->addWidget(presetsBtn);
         row->addWidget(browseBtn);
         row->addWidget(clearBtn);
         sl->addLayout(row);
@@ -2929,9 +2943,100 @@ private:
         if (path != shaderPath->text().trimmed())
             shaderParams.clear();
         shaderPath->setText(path);
-        if (!path.isEmpty())
+        if (!path.isEmpty()) {
             lastShaderDir = QFileInfo(path).path();
+            rememberPreset(path);
+        }
         updateParamsButton();
+    }
+
+    // ----- favourite and recently used presets (shared by all games) -----
+
+    QStringList presetList(const char *key) const {
+        QSettings prefs = makePrefs();
+        return prefs.value(key).toStringList();
+    }
+
+    void storePresetList(const char *key, const QStringList &list) {
+        QSettings prefs = makePrefs();
+        prefs.setValue(key, list);
+    }
+
+    // Puts a preset at the top of the recent list (once, whatever the spelling of its path).
+    void rememberPreset(const QString &path) {
+        const QString clean = QDir::cleanPath(path);
+        if (clean.isEmpty() || IsLegacyPreset(clean))
+            return;
+        QStringList recent = presetList(PREFS_RECENT_PRESETS);
+        recent.removeAll(clean);
+        recent.prepend(clean);
+        while (recent.size() > MAX_RECENT_PRESETS)
+            recent.removeLast();
+        storePresetList(PREFS_RECENT_PRESETS, recent);
+    }
+
+    bool isFavoritePreset(const QString &path) const {
+        return presetList(PREFS_FAVORITE_PRESETS).contains(QDir::cleanPath(path));
+    }
+
+    void setFavoritePreset(const QString &path, bool on) {
+        const QString clean = QDir::cleanPath(path);
+        QStringList fav = presetList(PREFS_FAVORITE_PRESETS);
+        fav.removeAll(clean);
+        if (on)
+            fav.append(clean);
+        storePresetList(PREFS_FAVORITE_PRESETS, fav);
+    }
+
+    // "name  (folder)": the folder tells apart the many presets called "crt-royale".
+    static QString presetLabel(const QString &path) {
+        const QFileInfo fi(path);
+        QString label = fi.completeBaseName();
+        const QString folder = QFileInfo(fi.path()).fileName();
+        if (!folder.isEmpty())
+            label += "  (" + folder + ")";
+        if (!fi.exists())
+            label += "  - missing";
+        return label;
+    }
+
+    void rebuildPresetsMenu() {
+        presetsMenu->clear();
+        const QString current = QDir::cleanPath(shaderPath->text().trimmed());
+        const QStringList favorites = presetList(PREFS_FAVORITE_PRESETS);
+        QStringList recent;
+        for (const QString &p : presetList(PREFS_RECENT_PRESETS))
+            if (!favorites.contains(p))
+                recent << p;
+
+        auto addPresets = [&](const QString &title, const QStringList &list) {
+            presetsMenu->addSection(title);
+            for (const QString &path : list) {
+                QAction *a = presetsMenu->addAction(presetLabel(path));
+                a->setToolTip(path);
+                a->setEnabled(QFileInfo::exists(path));
+                a->setCheckable(true);
+                a->setChecked(path == current);
+                connect(a, &QAction::triggered, this, [this, path]() { setShaderPreset(path); });
+            }
+        };
+        if (!favorites.isEmpty())
+            addPresets("Favourites", favorites);
+        if (!recent.isEmpty())
+            addPresets("Recent", recent);
+        if (favorites.isEmpty() && recent.isEmpty())
+            presetsMenu->addAction("No presets used yet")->setEnabled(false);
+
+        presetsMenu->addSeparator();
+        const bool haveCurrent = !current.isEmpty() && current != "." && !IsLegacyPreset(current);
+        const bool isFav = haveCurrent && favorites.contains(current);
+        QAction *toggle = presetsMenu->addAction(isFav ? "Remove the current preset from favourites"
+                                                       : "Add the current preset to favourites");
+        toggle->setEnabled(haveCurrent);
+        connect(toggle, &QAction::triggered, this, [this, current, isFav]() { setFavoritePreset(current, !isFav); });
+        QAction *forget = presetsMenu->addAction("Clear the recent list");
+        forget->setEnabled(!recent.isEmpty());
+        connect(forget, &QAction::triggered, this, [this]() { storePresetList(PREFS_RECENT_PRESETS, QStringList()); });
     }
 
     void browseShader() {
@@ -3618,6 +3723,8 @@ private:
             return false;
         }
         recordLaunch();
+        if (useShader)
+            rememberPreset(preset);
         return true;
     }
 
